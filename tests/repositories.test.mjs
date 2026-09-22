@@ -155,3 +155,32 @@ test('cache expiry and concurrent calls use one bounded ghq discovery', async (t
   await service.list();
   assert.equal(calls, 2);
 });
+
+// A rescan walks the whole tree, and the sidebar renders whatever it receives as the complete
+// list — so blocking an expired call on that walk emptied every repository group until it landed.
+test('an expired list is served immediately while the rescan runs behind it', async (t) => {
+  const root = await fixture(t);
+  await repository(root, 'github.com/acme/one');
+  let now = 100;
+  let calls = 0;
+  let release;
+  const service = new RepositoryService({
+    clock: () => now,
+    cacheTtl: 60,
+    execFileFn(command, args, options, callback) {
+      calls += 1;
+      if (calls === 1) return void setTimeout(() => callback(null, `${root}\n`), 5);
+      release = () => callback(null, `${root}\n`);
+    },
+  });
+
+  const primed = await service.list();
+  assert.equal(primed.repositories.length, 1);
+
+  now = 161;
+  const stale = await service.list();
+  assert.strictEqual(stale, primed, 'the expired call must resolve to the cached value, not wait for the rescan');
+  assert.equal(calls, 2, 'and it must still start the rescan');
+
+  release();
+});

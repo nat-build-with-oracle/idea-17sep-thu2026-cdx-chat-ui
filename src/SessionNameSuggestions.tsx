@@ -70,7 +70,7 @@ export default function SessionNameSuggestions({ candidates, capability, onClose
         <label className="field">Summarize with<select value={summaryModel} disabled={phase !== 'idle'} onChange={event => setSummaryModel(event.target.value as 'haiku' | 'sonnet')}><option value="haiku">Haiku</option><option value="sonnet">Sonnet</option></select></label>
         <p className="field-help">Then Opus suggests names</p>
       </div>
-      <p className="field-help">Generate sends a bounded text excerpt to Claude. Two model calls; normal usage charges apply. No tools, session resume, or automatic renaming.</p>
+      <p className="field-help">Generate sends a bounded text excerpt to Codex. Two model calls; normal usage charges apply. No tools, session resume, or automatic renaming.</p>
       <button className="subtle-button" type="button" disabled={!candidate || !capability || phase !== 'idle'} onClick={() => void generate()}>{phase === 'generating' ? 'Summarizing and suggesting…' : result ? 'Generate again' : 'Generate suggestions'}</button>
       {phase === 'generating' && <p role="status" className="field-help">Reading an excerpt, then asking for three names. You can cancel without changing the session.</p>}
       {error && <p role="alert" className="naming-notice">{error}</p>}

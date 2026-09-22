@@ -4,7 +4,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
 
-test('session identity displays and copies the exact Claude ID, not a chat route ID', async t => {
+test('session identity displays and copies the exact Codex thread ID, not a chat route ID', async t => {
   const server = await createServer({ server: { middlewareMode: true, watch: null, ws: false }, appType: 'custom' })
   t.after(() => server.close())
   const { default: Identity } = await server.ssrLoadModule('/src/SessionIdentity.tsx')
@@ -13,7 +13,7 @@ test('session identity displays and copies the exact Claude ID, not a chat route
   const props = { sessionId: id, onCopy: value => { copied = value } }
   const html = renderToStaticMarkup(createElement(Identity, props))
   assert.match(html, new RegExp(`<code>${id}</code>`))
-  assert.match(html, new RegExp(`aria-label="Copy Claude session ID ${id}"`))
+  assert.match(html, new RegExp(`aria-label="Copy Codex thread ID ${id}"`))
   Identity(props).props.onClick()
   assert.equal(copied, id)
   assert.equal(Identity({ ...props, sessionId: null }), null)

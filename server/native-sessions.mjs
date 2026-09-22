@@ -1,11 +1,10 @@
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { realpath } from 'node:fs/promises';
-import * as claudeSdk from '@anthropic-ai/claude-agent-sdk';
-import { normalizeUsage } from './claude-runner.mjs';
+import { CodexSessions } from './codex-sessions.mjs';
+import { withMcpDenial } from './codex-items.mjs';
 import { MawTerminalService } from './maw-terminals.mjs';
 
-const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const ACTIVE_BACKGROUND_STATES = new Set(['working', 'blocked']);
 const RESUMABLE_BACKGROUND_STATES = new Set(['done', 'completed', 'failed', 'stopped']);
 const ACTIVE_STATUSES = new Set(['busy', 'waiting', 'idle']);
@@ -28,6 +27,12 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
+// There is no `codex attach`. A thread another process holds and a thread waiting on disk
+// are reopened by the same command, which restores the thread's own working directory.
+function codexResume(id) {
+  return `codex resume ${shellQuote(id)}`;
+}
+
 function normalize(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
   const kind = record.kind === 'interactive' || record.kind === 'background' ? record.kind : null;
@@ -43,9 +48,7 @@ function normalize(record) {
   const action = active && kind === 'background' && id ? 'openTerminal'
     : active && kind === 'interactive' && sessionId ? 'resumeAfterExit'
       : resumable ? 'resume' : 'unavailable';
-  const terminalCommand = action === 'openTerminal' ? `claude attach ${shellQuote(id)}`
-    : (action === 'resume' || action === 'resumeAfterExit') ? `cd ${shellQuote(path.resolve(cwd))} && claude --resume ${shellQuote(sessionId)}`
-      : null;
+  const terminalCommand = action === 'unavailable' ? null : codexResume(sessionId || id);
   return {
     id,
     cwd: path.resolve(cwd),
@@ -81,7 +84,7 @@ function normalizeSaved(record) {
     status: null,
     waitingFor: null,
     action: 'resume',
-    terminalCommand: `cd ${shellQuote(resolvedCwd)} && claude --resume ${shellQuote(sessionId)}`,
+    terminalCommand: codexResume(sessionId),
   };
 }
 
@@ -130,15 +133,11 @@ function normalizeHistoryMessage(record, fallbackTime) {
       blocks.push({ type: 'tool', ...tool });
       tools.push(tool);
     } else if (block?.type === 'tool_result') {
-      blocks.push({ type: 'toolResult', toolUseId: shortString(block.tool_use_id, 500), content: blockText(block.content), isError: Boolean(block.is_error) });
+      blocks.push(withMcpDenial({ type: 'toolResult', toolUseId: shortString(block.tool_use_id, 500), content: blockText(block.content), isError: Boolean(block.is_error) }));
     }
   }
-  // Streamed Claude assistant records can repeat an incomplete usage snapshot
-  // for every content block. Only a completed API message has authoritative
-  // per-message usage; terminal CLI result records are not exposed by this SDK.
-  const usage = record.type === 'assistant' && message.stop_reason != null
-    ? normalizeUsage(message.usage, { scope: 'apiMessage' })
-    : null;
+  // A rollout item carries no token counts of its own, so a synced message keeps whatever
+  // whole-turn usage the live run stamped on it and shows none otherwise.
   return {
     id: shortString(record.uuid, 500) || `${record.session_id || 'history'}-${fallbackTime}`,
     role: record.type,
@@ -146,7 +145,6 @@ function normalizeHistoryMessage(record, fallbackTime) {
     createdAt: messageTime(record, fallbackTime),
     status: 'complete',
     ...(tools.length ? { tools } : {}),
-    ...(usage ? { usage } : {}),
     history: {
       sourceUuid: shortString(record.uuid, 500),
       parentToolUseId: shortString(record.parent_tool_use_id, 500),
@@ -156,10 +154,8 @@ function normalizeHistoryMessage(record, fallbackTime) {
 }
 
 export class NativeSessionService {
-  constructor({ execFileFn = execFile, sdk = claudeSdk, command = process.env.CLAUDE_BIN || 'claude', timeout = 5000, terminalLocator } = {}) {
+  constructor({ execFileFn = execFile, sdk = new CodexSessions({ execFileFn }), terminalLocator } = {}) {
     this.execFileFn = execFileFn;
-    this.command = command;
-    this.timeout = timeout;
     this.sdk = sdk;
     this.terminalLocator = terminalLocator || new MawTerminalService({ execFileFn });
     this.mutationQueue = Promise.resolve();
@@ -217,45 +213,38 @@ export class NativeSessionService {
     return result;
   }
 
+  // Liveness is the writer-lock claim itself, so a thread someone left open in an idle
+  // tab is listed as held — the same guard that keeps two writers off one thread.
   async #listActive() {
-    const output = await new Promise((resolve, reject) => {
-      const callback = (error, stdout) => {
-        if (error) return reject(Object.assign(new Error('Unable to list native Claude sessions'), { statusCode: 503, cause: error }));
-        resolve(String(stdout));
-      };
-      try {
-        this.execFileFn(this.command, ['agents', '--json', '--all'], { timeout: this.timeout, maxBuffer: MAX_OUTPUT_BYTES }, callback);
-      } catch (error) {
-        reject(Object.assign(new Error('Unable to list native Claude sessions'), { statusCode: 503, cause: error }));
-      }
-    });
     let records;
-    try { records = JSON.parse(output); }
-    catch { throw Object.assign(new Error('Claude returned invalid native session data'), { statusCode: 502 }); }
-    if (!Array.isArray(records)) throw Object.assign(new Error('Claude returned invalid native session data'), { statusCode: 502 });
+    try {
+      records = await this.sdk.listLiveThreads();
+    } catch (error) {
+      throw Object.assign(new Error('Unable to list live Codex threads'), { statusCode: 503, cause: error });
+    }
+    if (!Array.isArray(records)) throw Object.assign(new Error('Codex returned invalid live thread data'), { statusCode: 502 });
     return records.map(normalize).filter(Boolean);
   }
 
   async #listSaved() {
     try {
-      return (await this.sdk.listSessions({ limit: 500, offset: 0, includeProgrammatic: true })).map(normalizeSaved).filter(Boolean);
+      return (await this.sdk.listSessions({ limit: 500, offset: 0 })).map(normalizeSaved).filter(Boolean);
     } catch (error) {
-      throw Object.assign(new Error('Unable to list saved Claude sessions'), { statusCode: 503, cause: error });
+      throw Object.assign(new Error('Unable to list saved Codex threads'), { statusCode: 503, cause: error });
     }
   }
 
   async resumable(sessionId) {
     if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 200) throw Object.assign(new Error('Invalid native session id'), { statusCode: 400 });
     const session = (await this.list()).find((entry) => entry.sessionId === sessionId);
-    if (!session) throw Object.assign(new Error('Native Claude session not found'), { statusCode: 404 });
+    if (!session) throw Object.assign(new Error('Codex thread not found'), { statusCode: 404 });
     if (session.action === 'openTerminal' || session.action === 'resumeAfterExit') {
-      const owner = session.status === 'idle' ? 'An idle Claude terminal still holds this session' : 'Another Claude process still holds this session';
       const pid = session.pid ? ` (PID ${session.pid})` : '';
       const terminal = session.existingTerminal;
       const attach = terminal ? ` Existing maw terminal: ${terminal.target}. Attach with: ${terminal.attachCommand}.` : '';
-      throw Object.assign(new Error(`${owner}${pid}. Its last turn may be done, but the process has not exited. Use that terminal, or exit it before sending here. History sync remains available.${attach}`), { statusCode: 409 });
+      throw Object.assign(new Error(`Another Codex process still holds this thread's writer lock${pid}. Its last turn may be done, and an open idle thread still counts as held. Use that terminal, or exit it before sending here. History sync remains available.${attach}`), { statusCode: 409 });
     }
-    if (session.action !== 'resume') throw Object.assign(new Error('Native Claude session cannot be resumed'), { statusCode: 409 });
+    if (session.action !== 'resume') throw Object.assign(new Error('Codex thread cannot be resumed'), { statusCode: 409 });
     return session;
   }
 
@@ -263,14 +252,14 @@ export class NativeSessionService {
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) throw Object.assign(new Error('Invalid message offset'), { statusCode: 400 });
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw Object.assign(new Error('Message limit must be between 1 and 200'), { statusCode: 400 });
     const session = (await this.list()).find((entry) => entry.sessionId === sessionId);
-    if (!session) throw Object.assign(new Error('Native Claude session not found'), { statusCode: 404 });
+    if (!session) throw Object.assign(new Error('Codex thread not found'), { statusCode: 404 });
     let source;
     try {
       source = await this.sdk.getSessionMessages(sessionId, { offset, limit: limit + 1 });
     } catch (error) {
-      throw Object.assign(new Error('Unable to read native Claude session history'), { statusCode: 502, cause: error });
+      throw Object.assign(new Error('Unable to read Codex thread history'), { statusCode: 502, cause: error });
     }
-    if (!Array.isArray(source)) throw Object.assign(new Error('Claude SDK returned invalid session history'), { statusCode: 502 });
+    if (!Array.isArray(source)) throw Object.assign(new Error('Codex returned invalid thread history'), { statusCode: 502 });
     const hasMore = source.length > limit;
     const fallback = session.startedAt || 0;
     const messages = source.slice(0, limit).map((message, index) => normalizeHistoryMessage(message, fallback + index)).filter(Boolean);
@@ -283,9 +272,9 @@ export class NativeSessionService {
     try {
       before = await this.sdk.getSessionInfo(sessionId);
     } catch (error) {
-      throw Object.assign(new Error('Unable to read native Claude session metadata'), { statusCode: 502, cause: error });
+      throw Object.assign(new Error('Unable to read Codex thread metadata'), { statusCode: 502, cause: error });
     }
-    if (!before) throw Object.assign(new Error('Native Claude session not found'), { statusCode: 404 });
+    if (!before) throw Object.assign(new Error('Codex thread not found'), { statusCode: 404 });
     const changeToken = sessionChangeToken(before);
     if (previousToken === changeToken) return null;
 
@@ -293,19 +282,19 @@ export class NativeSessionService {
     try {
       source = await this.sdk.getSessionMessages(sessionId, { limit: 10_001 });
     } catch (error) {
-      throw Object.assign(new Error('Unable to read native Claude session history'), { statusCode: 502, cause: error });
+      throw Object.assign(new Error('Unable to read Codex thread history'), { statusCode: 502, cause: error });
     }
-    if (!Array.isArray(source)) throw Object.assign(new Error('Claude SDK returned invalid session history'), { statusCode: 502 });
-    if (source.length > 10_000) throw Object.assign(new Error('Native Claude session history exceeds the safe snapshot limit'), { statusCode: 413 });
+    if (!Array.isArray(source)) throw Object.assign(new Error('Codex returned invalid thread history'), { statusCode: 502 });
+    if (source.length > 10_000) throw Object.assign(new Error('Codex thread history exceeds the safe snapshot limit'), { statusCode: 413 });
 
     let after;
     try {
       after = await this.sdk.getSessionInfo(sessionId);
     } catch (error) {
-      throw Object.assign(new Error('Unable to verify native Claude session metadata'), { statusCode: 502, cause: error });
+      throw Object.assign(new Error('Unable to verify Codex thread metadata'), { statusCode: 502, cause: error });
     }
     if (!after || sessionChangeToken(after) !== changeToken) {
-      throw Object.assign(new Error('Native Claude session changed while history was being read'), { statusCode: 409, transient: true });
+      throw Object.assign(new Error('Codex thread changed while its history was being read'), { statusCode: 409, transient: true });
     }
     const fallback = before.createdAt ?? before.lastModified ?? 0;
     return {
@@ -322,15 +311,15 @@ export class NativeSessionService {
 
   async #rename(sessionId, title) {
     const session = (await this.list()).find((entry) => entry.sessionId === sessionId);
-    if (!session) throw Object.assign(new Error('Native Claude session not found'), { statusCode: 404 });
-    if (session.action !== 'resume') throw Object.assign(new Error('Native Claude session cannot be safely renamed while live ownership is unknown or active'), { statusCode: 409 });
+    if (!session) throw Object.assign(new Error('Codex thread not found'), { statusCode: 404 });
+    if (session.action !== 'resume') throw Object.assign(new Error('Codex thread cannot be safely renamed while live ownership is unknown or active'), { statusCode: 409 });
     try {
-      await this.sdk.renameSession(sessionId, title, { dir: session.cwd });
+      await this.sdk.renameSession(sessionId, title);
     } catch (error) {
-      throw Object.assign(new Error('Unable to rename native Claude session'), { statusCode: 502, cause: error });
+      throw Object.assign(new Error('Unable to rename Codex thread'), { statusCode: 502, cause: error });
     }
     let refreshed;
-    try { refreshed = await this.sdk.getSessionInfo?.(sessionId, { dir: session.cwd }); }
+    try { refreshed = await this.sdk.getSessionInfo?.(sessionId); }
     catch { /* Rename succeeded; a metadata refresh failure must not report otherwise. */ }
     return { ...session, name: shortString(refreshed?.customTitle || refreshed?.summary, 500) || title };
   }

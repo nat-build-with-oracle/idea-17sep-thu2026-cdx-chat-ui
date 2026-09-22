@@ -9,7 +9,7 @@ const server = await createServer({
   cwd: process.env.CC_CHAT_CWD || process.cwd(),
 });
 server.listen(port, '127.0.0.1', () => {
-  console.log(`[${new Date().toISOString()}] ARRA Claude Code listening on http://127.0.0.1:${port} (PID ${process.pid})`);
+  console.log(`[${new Date().toISOString()}] ARRA Codex listening on http://127.0.0.1:${port} (PID ${process.pid}) · Timeline at /api/timeline/view`);
 });
 
 let vpnServer;
@@ -21,12 +21,13 @@ try {
     vpnServer = createVpnProxy({ ...vpn, port, loopbackServer: server, sessions });
     vpnServer.on('error', error => console.error(`VPN listener unavailable: ${error.message}`));
     vpnServer.listen(port, vpn.address, () => console.log(`ARRA VPN access: http://${vpn.hostname}:${port} (${vpn.authMode === 'NO_AUTH' ? 'NO_AUTH — VPN peers have full access' : vpn.authMode + ' — unlock link required'})`));
-    // The existing Timeline remains on localhost. Both entry points share the
-    // app's auth sessions; no second login or cookie collision across ports.
+    // The Timeline is a route on this same backend now, so the bridge forwards to our
+    // own port. Both entry points share the app's auth sessions; no second login or
+    // cookie collision across ports.
     for (const address of ['127.0.0.1', vpn.address]) {
-      const timeline = createVpnProxy({ ...vpn, port: 47882, upstreamPort: 47881, sessions });
+      const timeline = createVpnProxy({ ...vpn, port: 47882, upstreamPort: port, sessions });
       timeline.on('error', error => console.error(`Timeline bridge unavailable on ${address}: ${error.message}`));
-      timeline.listen(47882, address, () => console.log(`ARRA Timeline bridge: ${address}:47882 → localhost:47881`));
+      timeline.listen(47882, address, () => console.log(`ARRA Timeline bridge: http://${address}:47882/api/timeline/view → 127.0.0.1:${port}`));
       timelineServers.push(timeline);
     }
   }
@@ -47,6 +48,12 @@ async function shutdown() {
   }
   await server.app.close();
   server.close(() => process.exit(0));
+  // close() only stops new connections and waits for the rest to drain, which an open
+  // browser tab never does: its /api/events stream and any request still in flight kept
+  // the process alive for minutes after the listener was released.
+  server.closeAllConnections();
+  // Belt and braces: leave anyway if some future long-lived response outlives the sockets.
+  setTimeout(() => process.exit(0), 5_000).unref();
 }
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => { void shutdown(); });

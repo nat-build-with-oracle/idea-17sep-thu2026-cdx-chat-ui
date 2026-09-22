@@ -39,28 +39,23 @@ test('preview and live links retain host and reset only the preview flag and rou
   assert.equal(workspaceLink(`${cloud}?host=localhost:4319&preview=oracle`,false),'/?host=localhost%3A4319#/new')
 })
 
-test('Timeline follows the selected remote backend and preserves the full return URL', () => {
+test('Timeline follows the selected remote backend and stays on that backend origin', () => {
   const href = 'http://workstation.example:4318/sessions?host=http%3A%2F%2Fworkstation.example%3A4318#/sessions/11111111-2222-4333-8444-555555555555'
   const link = new URL(timelineLink(href, new URL(href).hash))
-  assert.equal(link.origin, 'http://workstation.example:47882')
-  assert.equal(link.searchParams.get('view'), 'timeline')
-  assert.equal(link.searchParams.get('returnTo'), href)
+  assert.equal(link.origin, 'http://workstation.example:4318')
+  assert.equal(link.pathname, '/api/timeline/view')
+  assert.equal(link.search, '')
 })
 
-test('Timeline return route updates with selection without losing backend query or filters', () => {
-  const href = `${cloud}?host=https%3A%2F%2Fbackend.example#/sessions/old`
+test('Timeline is a route on the backend that serves the chat, for every selected origin', () => {
   const hash = '#/sessions/new?tab=saved&q=hello+world'
-  const link = new URL(timelineLink(href, hash))
-  assert.equal(link.origin, 'https://backend.example:47882')
-  const back = new URL(link.searchParams.get('returnTo'))
-  assert.equal(back.origin, new URL(cloud).origin)
-  assert.equal(back.searchParams.get('host'), 'https://backend.example')
-  assert.equal(back.hash, hash)
+  assert.equal(timelineLink(`${cloud}?host=https%3A%2F%2Fbackend.example#/sessions/old`, hash), 'https://backend.example/api/timeline/view')
+  assert.equal(timelineLink(`${cloud}#/sessions/old`, hash), 'http://127.0.0.1:4318/api/timeline/view')
 })
 
-test('local Timeline keeps the existing local service without needing a VPN listener', () => {
+test('local Timeline is served by the chat backend, never the retired 47881/47882 service', () => {
   const href = 'http://127.0.0.1:4318/#/sessions/local'
-  const link = new URL(timelineLink(href, '#/sessions/local'))
-  assert.equal(link.origin, 'http://127.0.0.1:47881')
-  assert.equal(link.searchParams.get('returnTo'), href)
+  const link = timelineLink(href, '#/sessions/local')
+  assert.equal(link, 'http://127.0.0.1:4318/api/timeline/view')
+  assert.doesNotMatch(link, /4788[12]/)
 })

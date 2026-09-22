@@ -25,7 +25,7 @@ export async function request<T>(path: string, method = 'GET', body?: unknown, s
   }
   const data = await response.json().catch(() => null)
   if (!response.ok) throw new Error(data?.error || `Request failed (${response.status}). Please try again.`)
-  if (response.status !== 204 && data === null) throw new Error(`The backend at ${target.origin} did not return JSON. Choose a compatible Claude workspace API, not the static frontend address.`)
+  if (response.status !== 204 && data === null) throw new Error(`The backend at ${target.origin} did not return JSON. Choose a compatible Codex workspace API, not the static frontend address.`)
   return data as T
 }
 

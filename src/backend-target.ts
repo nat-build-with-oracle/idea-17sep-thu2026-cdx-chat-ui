@@ -37,13 +37,10 @@ export function workspaceLink(href: string, preview: boolean) {
   return `${url.pathname}${url.search}${url.hash}`
 }
 
-/** Timeline lives alongside the selected backend, not on the visiting device. */
-export function timelineLink(href: string, hash: string) {
-  const target = new URL(backendTarget(href).origin)
-  target.port = isLoopback(target.hostname) ? '47881' : '47882'
-  const returnTo = new URL(href)
-  returnTo.hash = hash
-  target.searchParams.set('view', 'timeline')
-  target.searchParams.set('returnTo', returnTo.href)
-  return target.href
+/** Timeline is a route on the selected backend now, not a separate service or port. */
+export function timelineLink(href: string, hash?: string) {
+  // One process serves chat and Timeline, so the old returnTo round trip is dead weight:
+  // callers still pass the route hash, and browser Back restores the exact ARRA session.
+  void hash
+  return new URL('/api/timeline/view', backendTarget(href).origin).href
 }

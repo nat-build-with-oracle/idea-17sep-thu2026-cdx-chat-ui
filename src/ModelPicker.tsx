@@ -1,13 +1,15 @@
 import { Icon } from './Icon'
-import { CLAUDE_MODELS } from './claude-chat'
 
-export default function ModelPicker({ model, disabled, onChange }: {
-  model: string; disabled: boolean
+export default function ModelPicker({ model, models, disabled, onChange }: {
+  model: string; models: readonly string[]; disabled: boolean
   onChange: (model: string) => void
 }) {
-  return <label className="model-picker" title="Choose a Claude model">
-    <select aria-label="Claude model" value={model} disabled={disabled} onChange={event => onChange(event.target.value)}>
-      {CLAUDE_MODELS.map(name => <option key={name} value={name}>Claude {name[0].toUpperCase()}{name.slice(1)}</option>)}
+  // The stored model of an older chat may no longer be offered; keep it selectable so
+  // the picker never silently reports a model the conversation is not using.
+  const options = model && !models.includes(model) ? [model, ...models] : models
+  return <label className="model-picker" title="Choose a Codex model">
+    <select aria-label="Codex model" value={model} disabled={disabled} onChange={event => onChange(event.target.value)}>
+      {options.map(name => <option key={name} value={name}>{name}</option>)}
     </select><Icon name="chevron" size={12} className="turn-down" />
   </label>
 }

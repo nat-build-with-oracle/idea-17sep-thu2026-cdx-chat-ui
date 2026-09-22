@@ -19,7 +19,7 @@ test('filtering exposes only the two supported commands with explicit descriptio
   assert.deepEqual(matchSlashCommands('').map(command => command.token), ['/rename', '/list-agents'])
   assert.deepEqual(matchSlashCommands('list').map(command => command.token), ['/list-agents'])
   assert.deepEqual(matchSlashCommands('ren'), [{ token: '/rename', description: 'Rename this conversation' }])
-  assert.equal(SLASH_COMMANDS[1].description, 'Find running Claude agents')
+  assert.equal(SLASH_COMMANDS[1].description, 'Find running Codex agents')
 })
 
 test('selection inserts a trailing space and closes the query so later Enter can submit', () => {

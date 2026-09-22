@@ -23,6 +23,6 @@ const paths: Record<IconName, string[]> = {
 export function Icon({ name, size = 19, className = '', style }: { name: IconName; size?: number; className?: string; style?: CSSProperties }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" className={className} style={style} aria-hidden="true">{paths[name].map((d, i) => <path d={d} key={i} />)}</svg>
 }
-export function ClaudeMark({ size = 26, className = '' }: { size?: number; className?: string }) {
-  return <svg width={size} height={size} viewBox="0 0 32 32" className={className} fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" aria-hidden="true">{Array.from({ length: 6 }, (_, i) => <path d="M16 4v24" transform={`rotate(${i * 30} 16 16)`} key={i} />)}</svg>
+export function BrandMark({ size = 26, className = '' }: { size?: number; className?: string }) {
+  return <svg width={size} height={size} viewBox="0 0 32 32" className={className} fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="6" y="6" width="20" height="20" rx="5" /></svg>
 }

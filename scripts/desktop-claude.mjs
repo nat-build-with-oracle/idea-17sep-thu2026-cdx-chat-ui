@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { createClaudeEnvironment } from '../server/claude-environment.mjs';
+import { createCodexEnvironment } from '../server/codex-environment.mjs';
 
 const run = promisify(execFile);
 const app = '/Applications/ARRA Claude Code Server.app';
@@ -116,14 +116,14 @@ function launch(env) {
 
 export async function main(args = process.argv.slice(2)) {
   if (args.some(arg => arg !== '--update') || process.platform !== 'darwin') throw new Error('Use on macOS: just desktop-claude [or just desktop-update-claude].');
-  const env = createClaudeEnvironment(process.env);
+  const env = createCodexEnvironment(process.env);
   const settingsDir = path.join(os.homedir(), 'Library/Application Support', bundle);
   const settings = JSON.parse(await readFile(path.join(settingsDir, 'server-config.json'), 'utf8'));
   if (settings.port !== 4318) throw new Error('Expected the everyday installed app on port 4318; nothing changed.');
   const origin = `http://127.0.0.1:${settings.port}`;
   const update = args.includes('--update');
   await access(binary);
-  if (update) { await access(path.join(root, 'dist/version.json')); await access(path.join(root, 'server/claude-environment.mjs')); }
+  if (update) { await access(path.join(root, 'dist/version.json')); await access(path.join(root, 'server/codex-environment.mjs')); }
   await assertOwnedBackend(settings.port);
   if ((await currentAppPids()).length !== 1) throw new Error('Cannot identify the installed app process. No changes made.');
   const status = await jsonAt(origin, '/api/status');

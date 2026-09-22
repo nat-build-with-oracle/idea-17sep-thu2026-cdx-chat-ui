@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildWorkspaceRepositories } from '../src/workspace-model.ts'
+import { buildWorkspaceRepositories, OUTSIDE_PROJECTS_ID } from '../src/workspace-model.ts'
 import { initialRoute, recoverChatRoute } from '../src/route-recovery.ts'
 
 const repo = (id, path, modifiedAt = 0) => ({ id, path, name: path.split('/').pop(), modifiedAt })
@@ -22,6 +22,60 @@ test('native threads belong to nearest repository with path boundaries, imported
   assert.deepEqual(rows.find(row=>row.id==='nested').sessions.map(s=>s.sessionId), ['child'])
   assert.equal(rows.find(row=>row.id==='different').sessions.length, 0)
   assert.deepEqual(rows.find(row=>row.id===project.id).chats, [chat])
+  assert.deepEqual(rows.find(row=>row.id===OUTSIDE_PROJECTS_ID).sessions.map(s=>s.sessionId), ['unowned'])
+})
+
+test('threads with no repository collect into one Outside projects group, last and only when it has threads', () => {
+  const repositories = [repo('a','/Code/a',5), repo('b','/Code/b',1)]
+  const owned = [session('owned','/Code/a/src',10)]
+  assert.equal(buildWorkspaceRepositories([], repositories, owned, []).find(row=>row.id===OUTSIDE_PROJECTS_ID), undefined)
+  assert.equal(buildWorkspaceRepositories([], repositories, [], []).length, 2)
+  const rows = buildWorkspaceRepositories([], repositories, [...owned, session('home','/Users/beta',20), session('tmp','/private/tmp/scratch',30), session('near','/Code/a-not-inside',40)], [])
+  assert.deepEqual(rows.map(row=>row.id), ['a','b',OUTSIDE_PROJECTS_ID])
+  const group = rows[rows.length-1]
+  assert.equal(group.name, 'Outside projects')
+  assert.deepEqual(group.sessions.map(s=>s.sessionId), ['near','tmp','home'])
+  assert.deepEqual(rows[0].sessions.map(s=>s.sessionId), ['owned'])
+  assert.deepEqual(group.aliases, [])
+  assert.deepEqual(group.chats, [])
+  assert.equal(group.projectId, null)
+  // A relative path keeps the synthetic row out of every path-keyed preference, including the "/" fallback.
+  assert.ok(!group.path.startsWith('/'))
+  assert.notEqual(group.path.replace(/\/+$/,'') || '/', '/')
+})
+
+test('an imported thread outside every repository stays in its chat row instead of the Outside projects group', () => {
+  const rows = buildWorkspaceRepositories([], [repo('a','/Code/a')], [session('imported','/Users/beta/sandbox')], [{ id:'chat', projectId:'a', sessionId:'imported' }])
+  assert.equal(rows.find(row=>row.id===OUTSIDE_PROJECTS_ID), undefined)
+})
+
+test('preferences and search leave the synthetic group alone', async () => {
+  const { applyRepositoryPreferences, parseRepositoryPreferences, setRepositoryFavorite, setRepositoryName } = await import('../src/repository-preferences.ts')
+  const { searchRepositories } = await import('../src/project-search.ts')
+  const rows = buildWorkspaceRepositories([], [repo('a','/Code/a')], [session('loose','/Users/beta')], [])
+  const group = rows.find(row=>row.id===OUTSIDE_PROJECTS_ID)
+  const preferences = setRepositoryName(setRepositoryFavorite(parseRepositoryPreferences('{}'), group.path, true), group.path, 'Renamed')
+  assert.equal(preferences.favorites.size, 0)
+  assert.equal(preferences.names.size, 0)
+  const projected = applyRepositoryPreferences(rows, preferences)
+  assert.deepEqual(projected.map(row=>row.id), ['a', OUTSIDE_PROJECTS_ID])
+  assert.equal(projected[1].name, 'Outside projects')
+  assert.equal(projected[1].sessions.length, 1)
+  assert.deepEqual(searchRepositories(rows.filter(row=>row.id!==OUTSIDE_PROJECTS_ID), '', 'all').map(row=>row.id), ['a'])
+})
+
+test('the sidebar renders the group without any control that would start a chat in it', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
+  assert.match(source, /const repositoryRows = useMemo\(\(\) => preferredRows\.filter\(row => row\.id !== OUTSIDE_PROJECTS_ID\)/)
+  assert.match(source, /\{visibleOutsideProjects && projectRow\(visibleOutsideProjects\)\}/)
+  assert.match(source, /\{!preview && !outside && <RepositoryActions/)
+  assert.match(source, /\{!outside && <button className="project-empty" onClick=\{\(\) => newChat\(repo\.id\)\}/)
+  assert.match(source, /!outside && repositoryRows\.indexOf\(repo\) < 3/)
+  const picker = source.slice(source.indexOf('<div className="project-picker">'), source.indexOf('</select>'))
+  assert.match(picker, /repositoryRows\.map/)
+  assert.doesNotMatch(picker, /preferredRows|outsideProjects/)
+  assert.match(source, /<ProjectSearch repositories=\{repositoryRows\}/)
 })
 
 test('repository ordering uses filesystem mtime, threads are newest first with deterministic ties', () => {

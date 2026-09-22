@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { joinTurnText, withMcpDenial } from './codex-items.mjs';
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -6,7 +7,7 @@ function canonical(value) {
   return value;
 }
 
-// A source fingerprint, not a comparison between raw JSONL and UI JSON.
+// A source fingerprint, not a comparison between the raw rollout and UI JSON.
 export function transcriptHash(messages) {
   const source = messages.map(message => ({
     uuid: message.history?.sourceUuid || message.id,
@@ -22,24 +23,28 @@ export function transcriptHash(messages) {
 
 const identity = message => message.history?.sourceUuid || message.id;
 const human = message => message.role === 'user' && !message.history?.blocks.some(block => block.type === 'toolResult');
-const conflict = () => new Error('Claude history could not be matched to saved messages. Your saved messages were kept; retry sync after the CLI finishes.');
+const conflict = () => new Error('Codex history could not be matched to saved messages. Your saved messages were kept; retry sync after the thread finishes.');
+
+// The live turn puts the app's own denial on the tool card; the rollout keeps only codex's
+// internal refusal, so a synced denied call would otherwise read as an ordinary result.
+const reconciledBlock = withMcpDenial;
 
 function bind(message, records) {
   const first = records[0];
-  const blocks = records.flatMap(record => record.history?.blocks || []);
+  const blocks = records.flatMap(record => record.history?.blocks || []).map(reconciledBlock);
   const tools = records.flatMap(record => record.tools || []);
   const merged = {
     ...first,
     id: message.id,
     role: message.role,
     createdAt: message.createdAt,
-    content: records.map(record => record.content).join(''),
+    content: joinTurnText(records.map(record => record.content)),
     history: { ...first.history, blocks },
     nativeSourceIds: records.map(identity),
     ...(tools.length ? { tools } : {}),
   };
-  // Live-run usage is a whole-turn total. Native records only carry API-message
-  // usage; replacing that total would lose subagent cost or count it twice.
+  // Live-run usage is a whole-turn total. A rollout record carries no usage of its own,
+  // and an API-message figure must never replace a turn total it does not cover.
   if (message.usage && message.usage.scope !== 'apiMessage') merged.usage = message.usage;
   if (message.status === 'error' || message.status === 'interrupted') {
     merged.status = message.status;
@@ -49,7 +54,7 @@ function bind(message, records) {
 }
 
 /** Project a complete native snapshot without deleting unmatched app data.
- * Legacy app records have random IDs and aggregate several Claude records. Bind
+ * Legacy app records have random IDs and aggregate several rollout records. Bind
  * those once, in order, then use native UUIDs exclusively on subsequent reads.
  */
 export function reconcileMessages(saved, source) {
@@ -181,7 +186,7 @@ export class TranscriptSync {
     let timeout;
     try {
       return await Promise.race([read, new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('Claude history read timed out; saved messages were kept.')), this.readTimeoutMs);
+        timeout = setTimeout(() => reject(new Error('Codex history read timed out; saved messages were kept.')), this.readTimeoutMs);
       })]);
     } finally { clearTimeout(timeout); }
   }
@@ -227,7 +232,7 @@ export class TranscriptSync {
       const failures = (this.failures.get(chatId)?.count || 0) + 1;
       this.failures.set(chatId, { count: failures, retryAt: Date.now() + Math.min(30_000, 2000 * 2 ** Math.min(failures - 1, 4)) });
       this.tokens.delete(chatId);
-      const detail = error.statusCode || error.message?.includes('saved messages') ? error.message : 'Unable to sync Claude history. Your saved messages were kept.';
+      const detail = error.statusCode || error.message?.includes('saved messages') ? error.message : 'Unable to sync Codex history. Your saved messages were kept.';
       const current = this.store.snapshot().chats.find(chat => chat.id === chatId);
       if (!unchanged(current) || (current.sync?.status === 'error' && current.sync.error === detail)) return false;
       await this.store.update(state => {

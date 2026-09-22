@@ -16,12 +16,12 @@ test('bound app chats report checking, synced, error, and live transcript states
   const render = (chat, props = {}) => renderToStaticMarkup(createElement(TranscriptSyncStatus, { chat, syncing: false, connected: true, onSync() {}, ...props }))
 
   const checking = render(baseChat)
-  assert.match(checking, /Checking Claude history/)
+  assert.match(checking, /Checking Codex history/)
   assert.match(checking, /No sync result is available yet/)
-  assert.doesNotMatch(checking, /Synced with Claude/)
+  assert.doesNotMatch(checking, /Synced with Codex/)
 
   const synced = render({ ...baseChat, sync: { status: 'synced', checkedAt: '2026-09-12T01:00:00.000Z', sourceHash: 'sha256:abc', messageCount: 12 } })
-  assert.match(synced, /Synced with Claude/)
+  assert.match(synced, /Synced with Codex/)
   assert.match(synced, /12 messages checked/)
   assert.match(synced, /Transcript fingerprint: sha256:abc/)
   assert.match(synced, /does not prove the rendered conversation matches the JSONL byte-for-byte/)
@@ -43,11 +43,11 @@ test('sync control reflects an in-flight refresh and disconnection', async t => 
   t.after(() => server.close())
   const { default: TranscriptSyncStatus } = await server.ssrLoadModule('/src/TranscriptSyncStatus.tsx')
   const syncing = renderToStaticMarkup(createElement(TranscriptSyncStatus, { chat: baseChat, syncing: true, connected: true, onSync() {} }))
-  assert.match(syncing, /Checking Claude history/)
+  assert.match(syncing, /Checking Codex history/)
   assert.match(syncing, /<button[^>]*disabled=""[^>]*>Syncing…<\/button>/)
   const disconnected = renderToStaticMarkup(createElement(TranscriptSyncStatus, { chat: baseChat, syncing: false, connected: false, onSync() {} }))
   assert.match(disconnected, /Disconnected/)
-  assert.match(disconnected, /Reconnect to check Claude history/)
+  assert.match(disconnected, /Reconnect to check Codex history/)
   assert.doesNotMatch(disconnected, /Live response/)
   assert.match(disconnected, /<button[^>]*disabled=""[^>]*>Sync now<\/button>/)
 
@@ -66,7 +66,7 @@ test('manual sync relies on SSE rather than applying a potentially stale POST re
   const source = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const method = source.slice(source.indexOf('async function syncChat()'), source.indexOf('function exportChat()'));
   assert.match(method, /const result = await api\.syncChat\(chatId\)/);
-  assert.match(method, /setToast\('Claude history synced'\)/);
+  assert.match(method, /setToast\('Codex history synced'\)/);
   assert.match(method, /setError\(result\.sync\?\.error/);
   assert.doesNotMatch(method, /applyChat/);
 });

@@ -21,6 +21,9 @@ async function fixture() {
     runner: new FakeRunner(),
     devOrigin: 'http://127.0.0.1:5173',
     frontendOrigin: FRONTEND_ORIGIN,
+    // Never reach the real codex binary or the developer's real ~/.codex.
+    listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] }),
+    environment: { PATH: process.env.PATH, CODEX_HOME: await mkdtemp(path.join(os.tmpdir(), 'cc-codex-home-')) },
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -176,7 +179,7 @@ test('hosted frontend configuration rejects anything except one exact credential
   for (const frontendOrigin of invalid) {
     const dataDir = await mkdtemp(path.join(os.tmpdir(), 'cc-chat-hosted-origin-invalid-'));
     await assert.rejects(
-      createServer({ dataDir, runner: new FakeRunner(), frontendOrigin }),
+      createServer({ dataDir, runner: new FakeRunner(), frontendOrigin, listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }] }) }),
       /CC_CHAT_FRONTEND_ORIGIN/,
       frontendOrigin,
     );
@@ -193,6 +196,9 @@ test('CC_CHAT_FRONTEND_ORIGIN enables the same exact hosted origin policy', asyn
   const server = await createServer({
     dataDir: await mkdtemp(path.join(os.tmpdir(), 'cc-chat-hosted-origin-env-')),
     runner: new FakeRunner(),
+    // Never reach the real codex binary or the developer's real ~/.codex.
+    listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] }),
+    environment: { PATH: process.env.PATH, CODEX_HOME: await mkdtemp(path.join(os.tmpdir(), 'cc-codex-home-')) },
   });
   t.after(() => new Promise((resolve) => server.close(resolve)));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -213,6 +219,9 @@ test('allow-any-origin mode is explicit, warned, observable, and still bounded b
     cwd: process.cwd(),
     runner: new FakeRunner(),
     allowAnyOrigin: true,
+    // Never reach the real codex binary or the developer's real ~/.codex.
+    listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] }),
+    environment: { PATH: process.env.PATH, CODEX_HOME: await mkdtemp(path.join(os.tmpdir(), 'cc-codex-home-')) },
   });
   console.warn = originalWarn;
   t.after(() => new Promise((resolve) => server.close(resolve)));
@@ -220,7 +229,7 @@ test('allow-any-origin mode is explicit, warned, observable, and still bounded b
   const origin = `http://127.0.0.1:${server.address().port}`;
 
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /websites can read conversations and execute Claude commands/i);
+  assert.match(warnings[0], /websites can read conversations and execute Codex commands/i);
   assert.match(warnings[0], /loopback/i);
 
   const health = await requestJson(`${origin}/api/health`, { headers: { origin: arbitraryOrigin } });
@@ -275,7 +284,7 @@ test('CC_CHAT_ALLOW_ANY_ORIGIN enables permissive origin reflection only for the
     else process.env.CC_CHAT_ALLOW_ANY_ORIGIN = previous;
   });
   process.env.CC_CHAT_ALLOW_ANY_ORIGIN = 'true';
-  const deniedServer = await createServer({ dataDir: await mkdtemp(path.join(os.tmpdir(), 'cc-chat-any-origin-off-')), runner: new FakeRunner() });
+  const deniedServer = await createServer({ dataDir: await mkdtemp(path.join(os.tmpdir(), 'cc-chat-any-origin-off-')), runner: new FakeRunner(), listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }] }) });
   t.after(() => new Promise((resolve) => deniedServer.close(resolve)));
   await new Promise((resolve) => deniedServer.listen(0, '127.0.0.1', resolve));
   const deniedBase = `http://127.0.0.1:${deniedServer.address().port}`;

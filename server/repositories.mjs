@@ -127,11 +127,19 @@ export class RepositoryService {
   async list() {
     const now = this.clock();
     if (this.cache && now - this.cache.createdAt < this.cacheTtl) return this.cache.value;
-    if (this.inflight) return this.inflight;
-    this.inflight = this.#discover().then((value) => {
-      this.cache = { createdAt: this.clock(), value };
-      return value;
-    }).finally(() => { this.inflight = null; });
+    if (!this.inflight) {
+      this.inflight = this.#discover().then((value) => {
+        this.cache = { createdAt: this.clock(), value };
+        return value;
+      }).finally(() => { this.inflight = null; });
+    }
+    // A rescan walks the whole tree and takes seconds, and the sidebar treats whatever it
+    // gets back as the complete list — so blocking on it collapses every repository group
+    // until the walk lands. An expired list is still the truth from a minute ago.
+    if (this.cache) {
+      this.inflight.catch(() => {});
+      return this.cache.value;
+    }
     return this.inflight;
   }
 

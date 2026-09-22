@@ -25,14 +25,14 @@ export function tmuxWindowName(sessionId: string, title?: string) {
 }
 
 export function tmuxSessionName(sessionId: string, cwd?: string, title?: string) {
-  const repository = asciiSlug(basename(cwd)) || 'claude'
+  const repository = asciiSlug(basename(cwd)) || 'codex'
   return `${repository}-${tmuxWindowName(sessionId, title)}`.slice(0, MAX_TMUX_NAME_LENGTH).replace(/-+$/g, '')
 }
 
 export function tmuxResumeCommand(sessionId: string, cwd?: string, title?: string, dangerous = false) {
   const name = tmuxSessionName(sessionId, cwd, title)
   const window = tmuxWindowName(sessionId, title)
-  const claude = `claude --resume ${shellQuote(sessionId)}${dangerous ? ' --dangerously-skip-permissions' : ''}`
+  const codex = `codex resume ${shellQuote(sessionId)}${dangerous ? ' --dangerously-bypass-approvals-and-sandbox' : ''}`
   const directory = cwd ? ` -c ${shellQuote(cwd)}` : ''
-  return `tmux new-session -d -s ${shellQuote(name)} -n ${shellQuote(window)}${directory} ${shellQuote(claude)} &&\ntmux set-option -t ${shellQuote(name)} status-left-length 100 &&\nmaw a ${shellQuote(name)}`
+  return `tmux new-session -d -s ${shellQuote(name)} -n ${shellQuote(window)}${directory} ${shellQuote(codex)} &&\ntmux set-option -t ${shellQuote(name)} status-left-length 100 &&\nmaw a ${shellQuote(name)}`
 }

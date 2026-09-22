@@ -71,7 +71,7 @@ function nativeMessage(id, role, content, extras = {}) {
 }
 
 async function startServer({ dataDir, nativeSessions, runner = new FakeRunner(), syncIntervalMs = 0 }) {
-  const server = await createServer({ dataDir, cwd: process.cwd(), nativeSessions, runner, syncIntervalMs, syncAuditMs: 60_000 });
+  const server = await createServer({ dataDir, cwd: process.cwd(), nativeSessions, runner, syncIntervalMs, syncAuditMs: 60_000, listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] }), environment: { PATH: process.env.PATH, CODEX_HOME: path.join(dataDir, 'codex-home') }, });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { server, runner, origin: `http://127.0.0.1:${server.address().port}` };
 }
@@ -366,7 +366,7 @@ test('a forced transient snapshot conflict invalidates prior sync and blocks sen
   native.error = Object.assign(new Error('Native Claude session changed while history was being read'), { statusCode: 409, transient: true });
   const blocked = await request(f.origin, `/api/chats/${chatId}/messages`, { method: 'POST', body: { content: 'unsafe send' } });
   assert.equal(blocked.status, 409);
-  assert.match(blocked.value.error, /Resolve the Claude history sync error/);
+  assert.match(blocked.value.error, /Resolve the Codex history sync error/);
   assert.equal(runner.calls.length, 0);
   let chat = f.server.app.store.snapshot().chats.find(item => item.id === chatId);
   assert.equal(chat.sync.status, 'error');

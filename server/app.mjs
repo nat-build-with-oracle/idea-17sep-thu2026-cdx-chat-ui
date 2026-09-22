@@ -4,31 +4,31 @@ import { access, stat } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ClaudeRunner } from './claude-runner.mjs';
+import { CodexAppServer } from './codex-app-server.mjs';
+import { CodexRunner } from './codex-runner.mjs';
+import { CodexSessions } from './codex-sessions.mjs';
 import { NativeSessionService } from './native-sessions.mjs';
-import { createClaudeEnvironment } from './claude-environment.mjs';
+import { createCodexEnvironment } from './codex-environment.mjs';
 import { TranscriptSync } from './transcript-sync.mjs';
 import { RepositoryService } from './repositories.mjs';
-import { SESSION_NAMING_CAPABILITY, SessionNamingService } from './session-naming.mjs';
+import { SESSION_NAMING_CAPABILITY, SessionNamingService } from './codex-session-naming.mjs';
+import { createTimelineRoutes } from './timeline/index.mjs';
 import { JsonStore, validateProjectPath } from './store.mjs';
 import { isEmptyRepositoryPreferences, sanitizeRepositoryPreferences } from './repository-preferences.mjs';
 
 const MIME = { '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
-const CHAT_MODELS = new Set(['sonnet', 'opus', 'haiku']);
 
-function isClaudeChat(chat) {
-  return (chat.provider === undefined || chat.provider === 'claude') && CHAT_MODELS.has(chat.model);
+// Provider is the whole gate. Model ids now come from the backend's own app-server and
+// change as OpenAI retires them, so a stored id can never decide whether a Codex chat
+// is still writable — while a chat from the removed Claude provider never is again.
+function isCodexChat(chat) {
+  return chat.provider === 'codex';
 }
 
-function assertClaudeChat(chat) {
-  if (!isClaudeChat(chat)) {
-    throw apiError('This conversation used a removed provider and is read-only. Start a new Claude chat to continue.', 409);
+function assertCodexChat(chat) {
+  if (!isCodexChat(chat)) {
+    throw apiError('This conversation used a removed provider and is read-only. Start a new Codex chat to continue.', 409);
   }
-}
-
-function validateClaudeInput(input) {
-  if ('provider' in input && input.provider !== 'claude') throw apiError('Only Claude Code is supported');
-  if ('model' in input && !CHAT_MODELS.has(input.model)) throw apiError('Invalid model');
 }
 const PERMISSION_MODES = new Set(['bypassPermissions', 'default']);
 
@@ -218,19 +218,47 @@ export async function createApp(options = {}) {
     ? process.env.CC_CHAT_ALLOW_ANY_ORIGIN === '1'
     : options.allowAnyOrigin === true;
   if (allowAnyOrigin) {
-    console.warn('WARNING: allow-any-origin mode is enabled. Websites can read conversations and execute Claude commands, even while this server is bound to loopback.');
+    console.warn('WARNING: allow-any-origin mode is enabled. Websites can read conversations and execute Codex commands, even while this server is bound to loopback.');
   }
   const cwd = path.resolve(options.cwd || process.cwd());
-  const claudeEnvironment = createClaudeEnvironment(options.environment ?? process.env);
+  const codexEnvironment = createCodexEnvironment(options.environment ?? process.env);
+  const codexHome = codexEnvironment.CODEX_HOME ? { codexHome: codexEnvironment.CODEX_HOME } : {};
   const store = options.store || await new JsonStore({ dataDir: options.dataDir, cwd }).init();
-  const runner = options.runner || new ClaudeRunner(options.runnerOptions);
-  const nativeSessions = options.nativeSessions || new NativeSessionService(options.nativeSessionOptions);
+  const runner = options.runner || new CodexRunner({ env: codexEnvironment, ...options.runnerOptions });
+  // One shared app-server child for history, rename and model/list. It must never take a
+  // writer lock, so every turn keeps its own private child inside CodexRunner.
+  const appServer = options.appServer || new CodexAppServer({ env: codexEnvironment });
+  const codexSessions = options.codexSessions || new CodexSessions({ server: appServer, ...codexHome });
+  const nativeSessions = options.nativeSessions || new NativeSessionService({ sdk: codexSessions, ...options.nativeSessionOptions });
   const repositories = options.repositories || new RepositoryService(options.repositoryOptions);
+  const timeline = options.timeline || createTimelineRoutes({ ...codexHome, ...options.timelineOptions });
   const sessionNaming = options.sessionNaming || new SessionNamingService({
     ...options.sessionNamingOptions,
     generateFn: options.sessionNameGenerator,
-    environmentForTarget: options.sessionNamingEnvironment || (() => claudeEnvironment),
+    environmentForTarget: options.sessionNamingEnvironment || (() => codexEnvironment),
   });
+  let modelsPromise = null;
+  // The machine's own app-server is the only honest source: a thread's stored model is
+  // history and includes ids turn/start now rejects. The default is placed first so a
+  // client with no saved choice adopts this machine's default.
+  function chatModels() {
+    if (!modelsPromise) {
+      modelsPromise = (options.listModels ? options.listModels() : appServer.request('model/list', {})).then((result) => {
+        const rows = (result?.data ?? []).filter((row) => row?.id && !row.hidden);
+        if (!rows.length) throw apiError('Codex reported no available models', 503);
+        const index = rows.findIndex((row) => row.isDefault);
+        return (index > 0 ? [rows[index], ...rows.filter((_, position) => position !== index)] : rows).map((row) => row.id);
+      });
+      // A probe that failed must never cache itself as "this machine has no models".
+      modelsPromise.catch(() => { modelsPromise = null; });
+    }
+    return modelsPromise;
+  }
+
+  async function validateCodexInput(input) {
+    if ('provider' in input && input.provider !== 'codex') throw apiError('Only Codex is supported');
+    if ('model' in input && !(await chatModels()).includes(input.model)) throw apiError('Invalid model');
+  }
   const configuredDevOrigin = options.devOrigin ?? process.env.DEV_ORIGIN ?? '';
   let devOrigin = '';
   if (configuredDevOrigin) {
@@ -242,20 +270,20 @@ export async function createApp(options = {}) {
   }
   const distDir = path.resolve(options.distDir || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist'));
   const broadcaster = makeBroadcaster(store);
-  const transcriptSync = new TranscriptSync({ store, nativeSessions, canSyncChat: isClaudeChat, intervalMs: options.syncIntervalMs, auditMs: options.syncAuditMs });
+  const transcriptSync = new TranscriptSync({ store, nativeSessions, canSyncChat: isCodexChat, intervalMs: options.syncIntervalMs, auditMs: options.syncAuditMs });
   const historyLoads = new Map();
   const activeRuns = new Set();
   let closing = false;
   let closePromise;
 
-  function assertClaudeSession(sessionId) {
-    for (const chat of store.snapshot().chats) if (chat.sessionId === sessionId) assertClaudeChat(chat);
+  function assertCodexSession(sessionId) {
+    for (const chat of store.snapshot().chats) if (chat.sessionId === sessionId) assertCodexChat(chat);
   }
 
   async function listedNativeSessions() {
     const snapshot = store.snapshot();
     const aliases = new Map(snapshot.nativeSessionAliases.map((alias) => [alias.sessionId, alias.title]));
-    const readOnlyIds = new Set(snapshot.chats.filter(chat => !isClaudeChat(chat)).map(chat => chat.sessionId).filter(Boolean));
+    const readOnlyIds = new Set(snapshot.chats.filter(chat => !isCodexChat(chat)).map(chat => chat.sessionId).filter(Boolean));
     return (await nativeSessions.list()).map((session) => {
       const alias = session.sessionId ? aliases.get(session.sessionId) : null;
       if (readOnlyIds.has(session.sessionId)) {
@@ -271,7 +299,7 @@ export async function createApp(options = {}) {
     if (historyLoads.has(chatId)) return historyLoads.get(chatId);
     const operation = (async () => {
       const before = findChat(store.snapshot(), chatId);
-      assertClaudeChat(before);
+      assertCodexChat(before);
       if (before.status === 'running') throw apiError('History cannot be loaded while a chat is running', 409);
       if (!before.nativeImported || !before.sessionId) throw apiError('Chat is not an imported native session', 409);
       const offset = before.historyNextOffset;
@@ -304,6 +332,7 @@ export async function createApp(options = {}) {
 
   async function finishRun(chatId, assistantId, done) {
     const result = await done;
+    if (result.unknownItemTypes?.length) console.warn(`Chat ${chatId}: Codex sent item type(s) this build cannot render: ${result.unknownItemTypes.join(', ')}`);
     await store.update((state) => {
       const chat = state.chats.find((item) => item.id === chatId);
       if (!chat) return null;
@@ -338,7 +367,7 @@ export async function createApp(options = {}) {
       const chat = findChat(launchState, chatId);
       const assistant = chat.messages.find((message) => message.id === assistantId);
       if (closing || chat.status !== 'running' || assistant?.status !== 'streaming') return;
-      assertClaudeChat(launch);
+      assertCodexChat(launch);
       done = runner.run({
         chatId,
         sessionId: launch.sessionId,
@@ -347,7 +376,7 @@ export async function createApp(options = {}) {
         permissionMode: launch.permissionMode,
         cwd: native && launch.nativeImported ? native.cwd : launch.cwd,
         prompt,
-        env: claudeEnvironment,
+        env: codexEnvironment,
         onUpdate(update) {
           void store.update((state) => {
             const current = state.chats.find((item) => item.id === chatId);
@@ -382,6 +411,9 @@ export async function createApp(options = {}) {
         if (!origin.corsOrigin) return json(response, 403, { error: 'Forbidden preflight' });
         return preflight(request, response);
       }
+      // In-process, so the Timeline's apiError status codes and CORS headers ride this
+      // same response — there is no second listener to authenticate separately.
+      if (await timeline(request, response, url)) return;
       if (request.method === 'GET' && url.pathname === '/api/state') {
         void transcriptSync.tick();
         return json(response, 200, store.snapshot());
@@ -403,7 +435,10 @@ export async function createApp(options = {}) {
       }
       if (request.method === 'GET' && url.pathname === '/api/health') {
         const health = await runner.health();
-        return json(response, 200, { ok: true, ...health, cwd, chatModels: [...CHAT_MODELS], sessionNaming: SESSION_NAMING_CAPABILITY, ...(allowAnyOrigin ? { allowAnyOrigin: true } : {}) });
+        // An unreachable Codex answers health with claudeAvailable:false; an empty model
+        // list is the same outage, not a 500 on the page the user checks it from.
+        const models = await chatModels().catch(() => []);
+        return json(response, 200, { ok: true, ...health, cwd, chatModels: models, sessionNaming: SESSION_NAMING_CAPABILITY, ...(allowAnyOrigin ? { allowAnyOrigin: true } : {}) });
       }
       if (request.method === 'GET' && url.pathname === '/api/status') {
         return json(response, 200, {
@@ -417,7 +452,7 @@ export async function createApp(options = {}) {
       }
       const historySessionId = nativeSessionId(url.pathname, '/messages');
       if (historySessionId && request.method === 'GET') {
-        assertClaudeSession(historySessionId);
+        assertCodexSession(historySessionId);
         const offset = url.searchParams.has('offset') ? Number(url.searchParams.get('offset')) : 0;
         const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 100;
         return json(response, 200, await nativeSessions.messages(historySessionId, { offset, limit }));
@@ -439,16 +474,16 @@ export async function createApp(options = {}) {
         let context;
         if (target.kind === 'chat') {
           const chat = findChat(store.snapshot(), target.id);
-          assertClaudeChat(chat);
+          assertCodexChat(chat);
           messages = chat.messages;
           sourceTruncated = Boolean(chat.historyTruncated || chat.historyUnavailable || (chat.historyNextOffset !== null && chat.historyNextOffset !== undefined));
           context = { kind: 'chat', model: chat.model };
         } else {
-          assertClaudeSession(target.id);
+          assertCodexSession(target.id);
           const history = await nativeSessions.messages(target.id, { offset: 0, limit: 200 });
           messages = history.messages;
           sourceTruncated = history.nextOffset !== null;
-          context = { kind: 'native', model: 'sonnet' };
+          context = { kind: 'native', model: null };
         }
         const controller = new AbortController();
         const abort = () => controller.abort();
@@ -471,9 +506,9 @@ export async function createApp(options = {}) {
         const title = value(input.title, 'Title', 120);
         const expected = expectedTitle(input.expectedTitle);
         let native = null;
-        if (target.kind === 'chat') assertClaudeChat(findChat(store.snapshot(), target.id));
+        if (target.kind === 'chat') assertCodexChat(findChat(store.snapshot(), target.id));
         if (target.kind === 'native') {
-          assertClaudeSession(target.id);
+          assertCodexSession(target.id);
           native = (await nativeSessions.list()).find((candidate) => candidate.sessionId === target.id);
           if (!native) throw apiError('Native session not found', 404);
         }
@@ -520,25 +555,27 @@ export async function createApp(options = {}) {
         const snapshot = store.snapshot();
         const projectId = input.projectId ?? null;
         projectFor(snapshot, projectId);
-        const model = input.model ?? 'sonnet';
+        await validateCodexInput(input);
+        const model = input.model ?? (await chatModels())[0];
+        // Full access is the default a new chat inherits, matching how every chat this
+        // app has ever started behaved.
         const permissionMode = input.permissionMode ?? 'bypassPermissions';
-        validateClaudeInput(input);
         if (!PERMISSION_MODES.has(permissionMode)) throw apiError('Invalid permission mode');
         const now = new Date().toISOString();
         const title = input.title === undefined ? 'New chat' : value(input.title, 'Title', 500);
-        const chat = { id: randomUUID(), title, projectId, sessionId: null, model, permissionMode, createdAt: now, updatedAt: now, messages: [], status: 'idle' };
+        const chat = { id: randomUUID(), title, projectId, sessionId: null, provider: 'codex', model, permissionMode, createdAt: now, updatedAt: now, messages: [], status: 'idle' };
         await store.update((state) => { state.chats.unshift(chat); return chat; });
         return json(response, 201, chat);
       }
       const importSessionId = nativeSessionId(url.pathname, '/import');
       if (importSessionId && request.method === 'POST') {
         const input = await body(request);
-        const model = input.model ?? 'sonnet';
-        validateClaudeInput(input);
-        assertClaudeSession(importSessionId);
+        await validateCodexInput(input);
+        const model = input.model ?? (await chatModels())[0];
+        assertCodexSession(importSessionId);
         const existing = store.snapshot().chats.find((chat) => chat.sessionId === importSessionId);
         if (existing) {
-          assertClaudeChat(existing);
+          assertCodexChat(existing);
           return json(response, 200, existing);
         }
         const native = await nativeSessions.resumable(importSessionId);
@@ -548,7 +585,7 @@ export async function createApp(options = {}) {
         const history = await nativeSessions.messages(native.sessionId, { offset: 0, limit: 200 });
         const imported = await store.update((state) => {
           const alreadyImported = state.chats.find((chat) => chat.sessionId === native.sessionId);
-          if (alreadyImported) { assertClaudeChat(alreadyImported); return alreadyImported; }
+          if (alreadyImported) { assertCodexChat(alreadyImported); return alreadyImported; }
           let project = state.projects.find((item) => (item.canonicalPath || item.path) === projectPath);
           const now = new Date().toISOString();
           if (!project) {
@@ -559,9 +596,10 @@ export async function createApp(options = {}) {
           const alias = state.nativeSessionAliases.find((item) => item.sessionId === native.sessionId);
           const chat = {
             id: randomUUID(),
-            title: alias?.title || native.name || 'Claude session',
+            title: alias?.title || native.name || 'Codex thread',
             projectId: project.id,
             sessionId: native.sessionId,
+            provider: 'codex',
             model,
             permissionMode,
             createdAt: startedAt,
@@ -580,7 +618,7 @@ export async function createApp(options = {}) {
       }
       const renameNativeSessionId = nativeSessionId(url.pathname);
       if (renameNativeSessionId && request.method === 'PATCH') {
-        assertClaudeSession(renameNativeSessionId);
+        assertCodexSession(renameNativeSessionId);
         const input = await body(request);
         if (Object.keys(input).some((key) => key !== 'title')) throw apiError('Unknown native session field');
         const title = value(input.title, 'Title', 500);
@@ -607,7 +645,7 @@ export async function createApp(options = {}) {
       if (syncChatId && request.method === 'POST') {
         await body(request);
         const chat = findChat(store.snapshot(), syncChatId);
-        assertClaudeChat(chat);
+        assertCodexChat(chat);
         if (chat.status === 'running') throw apiError('Wait for the web response to finish before syncing', 409);
         await transcriptSync.syncChat(syncChatId, { force: true });
         return json(response, 200, findChat(store.snapshot(), syncChatId));
@@ -623,20 +661,20 @@ export async function createApp(options = {}) {
         const allowed = new Set(['title', 'projectId', 'model', 'permissionMode']);
         if (Object.keys(input).some((key) => !allowed.has(key))) throw apiError('Unknown chat field');
         const current = findChat(store.snapshot(), chatId);
-        assertClaudeChat(current);
-        validateClaudeInput(input);
+        assertCodexChat(current);
+        await validateCodexInput(input);
         if ('title' in input) value(input.title, 'Title', 500);
         if ('permissionMode' in input && !PERMISSION_MODES.has(input.permissionMode)) throw apiError('Invalid permission mode');
         if ('projectId' in input) {
           const projectId = input.projectId ?? null;
           projectFor(store.snapshot(), projectId);
           if (current.status === 'running' && projectId !== current.projectId) throw apiError('Project cannot change while a chat is running', 409);
-          if (current.sessionId && projectId !== current.projectId) throw apiError('Project cannot change after a Claude session has started', 409);
+          if (current.sessionId && projectId !== current.projectId) throw apiError('Project cannot change after a Codex thread has started', 409);
         }
         if ('title' in input && current.sessionId && input.title.trim() !== current.title) await nativeSessions.rename(current.sessionId, input.title.trim());
         const updated = await store.update((state) => {
           const chat = findChat(state, chatId);
-          assertClaudeChat(chat);
+          assertCodexChat(chat);
           if ('title' in input) chat.title = value(input.title, 'Title', 500);
           if ('model' in input) chat.model = input.model;
           if ('permissionMode' in input) { if (!PERMISSION_MODES.has(input.permissionMode)) throw apiError('Invalid permission mode'); chat.permissionMode = input.permissionMode; }
@@ -644,7 +682,7 @@ export async function createApp(options = {}) {
             const projectId = input.projectId ?? null;
             projectFor(state, projectId);
             if (chat.status === 'running' && projectId !== chat.projectId) throw apiError('Project cannot change while a chat is running', 409);
-            if (chat.sessionId && projectId !== chat.projectId) throw apiError('Project cannot change after a Claude session has started', 409);
+            if (chat.sessionId && projectId !== chat.projectId) throw apiError('Project cannot change after a Codex thread has started', 409);
             chat.projectId = projectId;
           }
           chat.updatedAt = new Date().toISOString();
@@ -653,7 +691,7 @@ export async function createApp(options = {}) {
         return json(response, 200, updated);
       }
       if (chatId && request.method === 'DELETE') {
-        assertClaudeChat(findChat(store.snapshot(), chatId));
+        assertCodexChat(findChat(store.snapshot(), chatId));
         await runner.stop(chatId);
         await store.update((state) => { const index = state.chats.findIndex((chat) => chat.id === chatId); if (index < 0) throw apiError('Chat not found', 404); state.chats.splice(index, 1); return null; });
         response.writeHead(204); response.end(); return;
@@ -664,14 +702,14 @@ export async function createApp(options = {}) {
         const content = value(input.content, 'Message content');
         const beforeSend = findChat(store.snapshot(), messageChatId);
         if (beforeSend.status === 'running') throw apiError('Chat is already running', 409);
-        assertClaudeChat(beforeSend);
+        assertCodexChat(beforeSend);
         if (beforeSend.nativeImported && beforeSend.historyNextOffset !== null && beforeSend.historyNextOffset !== undefined) {
           throw apiError('Load the complete native session history before sending a new message', 409);
         }
         if (beforeSend.sessionId) {
           await nativeSessions.resumable(beforeSend.sessionId);
           const synced = await transcriptSync.syncChat(messageChatId, { force: true });
-          if (!synced || findChat(store.snapshot(), messageChatId).sync?.status === 'error') throw apiError('Resolve the Claude history sync error before sending a new message', 409);
+          if (!synced || findChat(store.snapshot(), messageChatId).sync?.status === 'error') throw apiError('Resolve the Codex history sync error before sending a new message', 409);
         }
         const now = new Date().toISOString();
         const userMessage = { id: randomUUID(), role: 'user', content, createdAt: now, status: 'complete' };
@@ -680,7 +718,7 @@ export async function createApp(options = {}) {
           if (closing) throw apiError('Backend is shutting down', 503);
           const current = findChat(state, messageChatId);
           if (current.status === 'running') throw apiError('Chat is already running', 409);
-          assertClaudeChat(current);
+          assertCodexChat(current);
           current.messages.push(userMessage, assistant);
           delete current.sync;
           current.status = 'running'; current.updatedAt = now;
@@ -690,7 +728,10 @@ export async function createApp(options = {}) {
             launch: {
               sessionId: current.sessionId,
               title: current.title,
-                model: current.model,
+              // startRun rechecks the gate right before launch, so the descriptor has to
+              // carry the field the gate reads.
+              provider: current.provider,
+              model: current.model,
               permissionMode: current.permissionMode,
               cwd: project?.path || cwd,
               nativeImported: Boolean(current.nativeImported),
@@ -706,11 +747,11 @@ export async function createApp(options = {}) {
       const stopChatId = routeId(url.pathname, '/stop');
       if (stopChatId && request.method === 'POST') {
         await body(request);
-        assertClaudeChat(findChat(store.snapshot(), stopChatId));
+        assertCodexChat(findChat(store.snapshot(), stopChatId));
         await runner.stop(stopChatId);
         await store.update((state) => {
           const chat = findChat(state, stopChatId);
-          assertClaudeChat(chat);
+          assertCodexChat(chat);
           chat.status = 'idle';
           chat.updatedAt = new Date().toISOString();
           for (const message of chat.messages) if (message.status === 'streaming') message.status = 'interrupted';
@@ -738,6 +779,9 @@ export async function createApp(options = {}) {
       // Run completion resolves before finishRun writes its final message. Wait
       // for that finalization, including launches awaiting native ownership.
       await Promise.allSettled([...activeRuns]);
+      // The shared app-server child's piped stdio keeps the event loop referenced, so an
+      // embedder awaiting close() hangs until this child is reaped.
+      await codexSessions.close();
       if (store.summary().running > 0) await store.update((state) => {
         for (const chat of state.chats) {
           if (chat.status !== 'running') continue;
