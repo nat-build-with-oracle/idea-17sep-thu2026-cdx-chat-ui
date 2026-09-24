@@ -16,6 +16,10 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
+# Swift app: xcodeproj is generated from src-swift/project.yml by xcodegen
+src-swift/*.xcodeproj
+src-swift/build/
+
 # Local runtime credentials and machine-specific settings (never release these).
 .env
 .env.*
