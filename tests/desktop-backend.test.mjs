@@ -11,6 +11,29 @@ import { fileURLToPath } from 'node:url';
 const FRONTEND_ORIGIN = 'https://cc-chat-ui.laris.workers.dev';
 const ENTRYPOINT = fileURLToPath(new URL('../server/index.mjs', import.meta.url));
 
+// The backend no longer asks a CLI for `--version`: it holds an app-server child open and
+// speaks JSON-RPC to it. The stand-in answers the three methods this process actually calls
+// and exits when its stdin closes, which is how app.close() reaps it.
+const FAKE_APP_SERVER = `#!/usr/bin/env node
+const readline = require('node:readline');
+const send = (message) => console.log(JSON.stringify(message));
+const RESULTS = {
+  initialize: { userAgent: 'codex_cli_rs/9.9.9 (fake app-server)' },
+  'account/read': { account: { planType: 'test-plan' } },
+  'model/list': { data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] },
+};
+const input = readline.createInterface({ input: process.stdin });
+input.on('line', (line) => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.id === undefined) return;
+  const result = RESULTS[message.method];
+  if (result) send({ jsonrpc: '2.0', id: message.id, result });
+  else send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: message.method + ' is not supported' } });
+});
+input.once('close', () => process.exit(0));
+`;
+
 async function freePort() {
   const server = net.createServer();
   await new Promise((resolve, reject) => {
@@ -57,14 +80,15 @@ async function fixture(t, { initialState, desktop = false } = {}) {
   const dataDir = path.join(root, 'data');
   const cwd = path.join(root, 'workspace');
   const home = path.join(root, 'home');
-  const fakeClaude = path.join(root, 'claude');
-  await Promise.all([mkdir(cwd), mkdir(home)]);
+  const codexHome = path.join(root, 'codex-home');
+  const fakeCodex = path.join(root, 'codex');
+  await Promise.all([mkdir(cwd), mkdir(home), mkdir(codexHome)]);
   if (initialState) {
     await mkdir(dataDir);
     await writeFile(path.join(dataDir, 'state.json'), `${JSON.stringify(initialState(cwd), null, 2)}\n`);
   }
-  await writeFile(fakeClaude, '#!/bin/sh\n[ "$1" = "--version" ] && { echo "fake-claude 1.0"; exit 0; }\nexit 97\n');
-  await chmod(fakeClaude, 0o755);
+  await writeFile(fakeCodex, FAKE_APP_SERVER);
+  await chmod(fakeCodex, 0o755);
 
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -75,7 +99,9 @@ async function fixture(t, { initialState, desktop = false } = {}) {
       ...process.env,
       PORT: String(port),
       HOME: home,
-      CLAUDE_BIN: fakeClaude,
+      CODEX_BIN: fakeCodex,
+      // Never let a real app-server, or the developer's real thread state, take part.
+      CODEX_HOME: codexHome,
       CC_CHAT_DATA_DIR: dataDir,
       CC_CHAT_CWD: cwd,
       CC_CHAT_FRONTEND_ORIGIN: FRONTEND_ORIGIN,
@@ -127,9 +153,12 @@ test('desktop backend permits health and state reads from the configured hosted 
   const health = await jsonRequest(`${f.origin}/api/health`, options);
   assert.equal(health.response.status, 200);
   assert.equal(health.response.headers.get('access-control-allow-origin'), FRONTEND_ORIGIN);
+  // claudeAvailable/claudeVersion are the frozen UI's field names for "a CLI is installed
+  // and answering", not a claim about whose CLI it is.
   assert.equal(health.value.claudeAvailable, true);
-  assert.equal(health.value.claudeVersion, 'fake-claude 1.0');
+  assert.equal(health.value.claudeVersion, '9.9.9');
   assert.equal(health.value.cwd, f.cwd);
+  assert.deepEqual(health.value.chatModels, ['gpt-6-astra', 'gpt-5.6-sol']);
 
   const state = await jsonRequest(`${f.origin}/api/state`, options);
   assert.equal(state.response.status, 200);
@@ -181,7 +210,7 @@ test('desktop status exposes exact hosted CORS and aggregate counts without mess
       projects: [{ id: 'project-1', name: 'Workspace', path: cwd, createdAt: '2026-01-01T00:00:00.000Z' }],
       chats: [
         {
-          id: 'chat-1', title: 'First', projectId: 'project-1', sessionId: null, model: 'sonnet', permissionMode: 'default',
+          id: 'chat-1', title: 'First', projectId: 'project-1', sessionId: null, provider: 'codex', model: 'gpt-6-astra', permissionMode: 'default',
           createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', status: 'idle',
           messages: [
             { id: 'message-1', role: 'user', content: secret, createdAt: '2026-01-01T00:00:00.000Z', status: 'complete' },
@@ -190,7 +219,7 @@ test('desktop status exposes exact hosted CORS and aggregate counts without mess
           sync: { status: 'error', error: 'private sync detail' },
         },
         {
-          id: 'chat-2', title: 'Second', projectId: null, sessionId: null, model: 'haiku', permissionMode: 'bypassPermissions',
+          id: 'chat-2', title: 'Second', projectId: null, sessionId: null, provider: 'codex', model: 'gpt-5.6-sol', permissionMode: 'bypassPermissions',
           createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', status: 'idle',
           messages: [{ id: 'message-3', role: 'user', content: 'more private text', createdAt: '2026-01-01T00:00:00.000Z', status: 'complete' }],
         },

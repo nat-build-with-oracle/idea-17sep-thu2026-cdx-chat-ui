@@ -84,7 +84,7 @@ test('expanded repository and session mentions add metadata without changing exe
     },
   };
   const runner = new FakeRunner();
-  const server = await createServer({ dataDir, cwd: currentPath, nativeSessions, repositories, runner });
+  const server = await createServer({ dataDir, cwd: currentPath, nativeSessions, repositories, runner, listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] }), environment: { PATH: process.env.PATH, CODEX_HOME: path.join(dataDir, 'codex-home') }, });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   t.after(async () => {

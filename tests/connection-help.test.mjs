@@ -23,7 +23,7 @@ test('connection help explains real browser permission without pretending to gra
   assert.match(local, /Site settings/)
   assert.match(local, /if available/)
   assert.match(local, /cannot grant this permission/)
-  assert.match(local, /run Claude commands/)
+  assert.match(local, /run Codex commands/)
   assert.match(local, /Retry connection/)
   assert.match(local, /never resends a message/)
   assert.match(local, /href="http:\/\/127\.0\.0\.1:4318\/"/)

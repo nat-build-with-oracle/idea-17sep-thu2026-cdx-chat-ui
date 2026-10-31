@@ -9,7 +9,7 @@ export default function ConnectionHelp({ origin, frontendOrigin, local, issue, c
   onRetry: () => void
   onClose: () => void
 }) {
-  return <Dialog title={local ? 'Connect to Claude on your Mac' : 'Connect to your backend'} onClose={onClose}>
+  return <Dialog title={local ? 'Connect to Codex on your Mac' : 'Connect to your backend'} onClose={onClose}>
     <div className="connection-help [&_p]:text-sm [&_p]:leading-[1.7] [&_strong]:wrap-anywhere">
       <p className="dialog-description">This browser could not connect to <strong>{origin}</strong>. A network error alone does not tell us whether permission, browser policy, or the backend is responsible.</p>
       {local ? <>
@@ -29,13 +29,13 @@ export default function ConnectionHelp({ origin, frontendOrigin, local, issue, c
           <div className="flex flex-wrap gap-x-4 gap-y-2 text-[13px]"><a href="https://www.perplexity.ai/help-center/comet/en/articles/11734702-adblock" target="_blank" rel="noreferrer">Comet Adblock guide</a><a href="https://www.perplexity.ai/help-center/comet/en/articles/11629598-manage-site-permissions" target="_blank" rel="noreferrer">Site-permission guide</a></div>
         </details>
       </> : <p>Check that this HTTPS backend is reachable and that its CORS settings allow this frontend’s exact origin. For LAN or VPN addresses, also check your network and browser’s local-network policy. Selecting an address does not add a tunnel or authentication.</p>}
-      <p className="panel-warning">Only connect to an interface and backend you trust. This connection can read conversations and run Claude commands with the permissions you choose.</p>
+      <p className="panel-warning">Only connect to an interface and backend you trust. This connection can read conversations and run Codex commands with the permissions you choose.</p>
       <details className="my-3.5 [&>summary]:cursor-pointer [&>summary]:py-2.5 [&>summary]:text-sm [&>summary]:font-semibold [&>p]:my-2.5 [&>a]:text-[13px]"><summary>Connection details</summary><p>Confirm the backend is running. A permission change cannot start a stopped backend or fix a mismatched allowed origin.</p><pre className="rounded-lg bg-[var(--color-raised)] p-3 text-xs wrap-anywhere whitespace-pre-wrap">{issue}</pre></details>
       <div className="dialog-footer flex-wrap">
         {local && <a className="subtle-button no-underline" href={`${origin}/`} target="_blank" rel="noreferrer">Open local app</a>}
         <button type="button" className="primary-button" disabled={checking} onClick={onRetry}>{checking ? 'Checking…' : 'Retry connection'}</button>
       </div>
-      <p className="field-help">Retry checks the backend and reconnects live updates. It never resends a message or starts a Claude run.</p>
+      <p className="field-help">Retry checks the backend and reconnects live updates. It never resends a message or starts a Codex run.</p>
     </div>
   </Dialog>
 }

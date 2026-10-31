@@ -5,49 +5,58 @@ import os from 'node:os';
 import path from 'node:path';
 import { NativeSessionService } from '../server/native-sessions.mjs';
 
-function serviceWith(value, error = null, sdkOverrides = {}, terminalLocator = { locate: async () => new Map() }) {
-  let invocation;
+// Live ownership used to come from `claude agents --json --all`. It now comes from
+// CodexSessions.listLiveThreads(), which reads the writer-lock table — so the double
+// is an sdk method, not a child process. execFileFn stays wired so the tests can prove
+// listing never shells out any more.
+function serviceWith(live, error = null, sdkOverrides = {}, terminalLocator = { locate: async () => new Map() }) {
+  let execCalls = 0;
   const sdk = {
     listSessions: async () => [],
+    listLiveThreads: async () => {
+      if (error) throw error;
+      return live;
+    },
     getSessionMessages: async () => [],
     getSessionInfo: async () => undefined,
     renameSession: async () => {},
     ...sdkOverrides,
   };
-  const service = new NativeSessionService({ execFileFn(command, args, options, callback) {
-    invocation = { command, args, options };
-    callback(error, typeof value === 'string' ? value : JSON.stringify(value));
-  }, sdk, terminalLocator });
-  return { service, invocation: () => invocation, sdk };
+  const service = new NativeSessionService({
+    execFileFn(command, args, options, callback) { execCalls += 1; callback(null, '[]'); },
+    sdk,
+    terminalLocator,
+  });
+  return { service, sdk, execCalls: () => execCalls };
 }
 
-test('native session discovery uses the bounded supported CLI and sanitizes records', async () => {
+test('live thread discovery reads the writer-lock inventory, shells out to nothing, and sanitizes records', async () => {
   const fixture = serviceWith([
-    { id: 'a', cwd: process.cwd(), kind: 'interactive', name: 'Live', pid: 42, sessionId: 'live-session', startedAt: 10, status: 'idle', secret: 'drop' },
+    { id: 'a', cwd: process.cwd(), kind: 'interactive', name: 'Live', pid: 42, sessionId: 'live-session', startedAt: 10, status: 'busy', secret: 'drop' },
     { id: 'b', cwd: process.cwd(), kind: 'background', name: 'Done', sessionId: 'done-session', startedAt: 20, state: 'completed' },
     { id: 'invalid', cwd: 'relative', kind: 'background' },
   ]);
   const sessions = await fixture.service.list();
-  assert.deepEqual(fixture.invocation().args, ['agents', '--json', '--all']);
-  assert.equal(fixture.invocation().options.timeout, 5000);
+  assert.equal(fixture.execCalls(), 0);
   assert.equal(sessions.length, 2);
   assert.equal(sessions.find((item) => item.id === 'a').action, 'resumeAfterExit');
-  assert.equal(sessions.find((item) => item.id === 'a').terminalCommand, "cd '" + process.cwd() + "' && claude --resume 'live-session'");
+  // No `cd`: `codex resume` restores the thread's own recorded working directory.
+  assert.equal(sessions.find((item) => item.id === 'a').terminalCommand, "codex resume 'live-session'");
   assert.equal(sessions.find((item) => item.id === 'b').action, 'resume');
-  assert.equal(sessions.find((item) => item.id === 'b').terminalCommand, "cd '" + process.cwd() + "' && claude --resume 'done-session'");
+  assert.equal(sessions.find((item) => item.id === 'b').terminalCommand, "codex resume 'done-session'");
   assert.equal('secret' in sessions[0], false);
 });
 
-test('active background sessions expose attach commands while interactive sessions wait for exit', async () => {
+test('there is no codex attach: a held thread and a waiting one are reopened by the same command', async () => {
   const fixture = serviceWith([
-    { id: "job'1", cwd: process.cwd(), kind: 'background', sessionId: 'background-session', state: 'blocked' },
+    { id: "job'1", cwd: process.cwd(), kind: 'background', sessionId: "background'session", state: 'blocked' },
     { id: 'interactive', cwd: process.cwd(), kind: 'interactive', sessionId: 'interactive-session', status: 'busy' },
   ]);
   const sessions = await fixture.service.list();
   assert.equal(sessions[0].action, 'openTerminal');
-  assert.equal(sessions[0].terminalCommand, "claude attach 'job'\\''1'");
+  assert.equal(sessions[0].terminalCommand, "codex resume 'background'\\''session'");
   assert.equal(sessions[1].action, 'resumeAfterExit');
-  assert.match(sessions[1].terminalCommand, /--resume 'interactive-session'$/);
+  assert.equal(sessions[1].terminalCommand, "codex resume 'interactive-session'");
 });
 
 test('native session import guard rejects active owners and requires exact full session id', async () => {
@@ -60,34 +69,39 @@ test('native session import guard rejects active owners and requires exact full 
   assert.equal((await fixture.service.resumable('resumable-id')).id, 'done');
 });
 
-test('native session discovery maps CLI failures and malformed output', async () => {
-  assert.deepEqual(await serviceWith([], new Error('missing')).service.list(), []);
-  assert.deepEqual(await serviceWith('{bad').service.list(), []);
-  const bothFail = serviceWith('{bad', null, { listSessions: async () => { throw new Error('SDK failed'); } });
+test('native session discovery maps lock-table failures and malformed live data', async () => {
+  assert.deepEqual(await serviceWith([], Object.assign(new Error('lock table unreadable'), { statusCode: 503 })).service.list(), []);
+  assert.deepEqual(await serviceWith(null).service.list(), []);
+  const bothFail = serviceWith(null, null, { listSessions: async () => { throw new Error('thread index failed'); } });
   await assert.rejects(bothFail.service.list(), (error) => error.statusCode === 502);
+  const lockFail = serviceWith([], new Error('lsof missing'), { listSessions: async () => { throw new Error('thread index failed'); } });
+  await assert.rejects(lockFail.service.list(), (error) => error.statusCode === 503);
 });
 
 test('saved sessions become read-only when live ownership inventory is unavailable', async () => {
   const cwd = process.cwd();
-  const fixture = serviceWith([], new Error('agents unavailable'), {
+  const fixture = serviceWith([], new Error('lock table unavailable'), {
     listSessions: async () => [{ sessionId: 'saved', cwd, summary: 'Saved', lastModified: 1 }],
     getSessionMessages: async () => [],
   });
   const session = (await fixture.service.list())[0];
   assert.equal(session.action, 'unavailable');
   assert.equal(session.status, 'liveStatusUnknown');
+  assert.equal(session.terminalCommand, "codex resume 'saved'");
   await assert.rejects(fixture.service.resumable('saved'), (error) => error.statusCode === 409);
   await assert.rejects(fixture.service.rename('saved', 'Unsafe'), (error) => error.statusCode === 409);
   assert.deepEqual(await fixture.service.messages('saved'), { messages: [], nextOffset: null });
 });
 
-test('saved SDK sessions merge with active inventory and active ownership wins', async () => {
+test('saved threads merge with the live inventory and an active holder wins', async () => {
   const cwd = process.cwd();
   const fixture = serviceWith([
     { id: 'job', cwd, kind: 'background', sessionId: 'same', state: 'working', startedAt: 20 },
   ], null, {
     listSessions: async (options) => {
-      assert.deepEqual(options, { limit: 500, offset: 0, includeProgrammatic: true });
+      // CodexSessions.listSessions has no programmatic tier to opt into; it filters to
+      // interactive threads itself.
+      assert.deepEqual(options, { limit: 500, offset: 0 });
       return [
         { sessionId: 'same', cwd, summary: 'Saved title', createdAt: 10, lastModified: 20 },
         { sessionId: 'saved', cwd, customTitle: 'Historical', createdAt: 30, lastModified: 40 },
@@ -108,7 +122,7 @@ test('history is normalized losslessly and paginated without trusting an active 
   const cwd = process.cwd();
   let getOptions;
   const fixture = serviceWith([
-    { id: 'live', cwd, kind: 'interactive', sessionId: 'history', status: 'idle' },
+    { id: 'live', cwd, kind: 'interactive', sessionId: 'history', status: 'busy' },
   ], null, {
     listSessions: async () => [{ sessionId: 'history', cwd: '/opt/black-oracle', summary: 'History', createdAt: 1000, lastModified: 2000 }],
     getSessionMessages: async (id, options) => {
@@ -128,7 +142,9 @@ test('history is normalized losslessly and paginated without trusting an active 
   assert.equal(page.messages[0].tools[0].name, 'Read');
 });
 
-test('history presents Claude slash-command envelopes as the command the user entered', async () => {
+// Inherited from the Claude transport and still in the normalizer: a Codex rollout never
+// writes this envelope, so it now only fires if someone literally types one.
+test('history presents a slash-command envelope as the command the user entered', async () => {
   const cwd = process.cwd();
   const fixture = serviceWith([], null, {
     listSessions: async () => [{ sessionId: 'commands', cwd, summary: 'Commands', createdAt: 1000 }],
@@ -142,25 +158,25 @@ test('history presents Claude slash-command envelopes as the command the user en
   assert.equal(page.messages[0].history.blocks[0].text.includes('<command-name>'), true);
 });
 
-test('history exposes only complete assistant usage and never fabricates missing or partial totals', async () => {
+// A rollout item carries no token counts at all, so a message rebuilt from disk shows
+// none rather than inventing a per-message figure. Only a live run stamps usage.
+test('history never fabricates token usage, because a rollout item carries none', async () => {
   const cwd = process.cwd();
   const fixture = serviceWith([], null, {
     listSessions: async () => [{ sessionId: 'usage-history', cwd, summary: 'Usage', createdAt: 1000 }],
     getSessionMessages: async (id) => [
-      { type: 'assistant', uuid: 'partial', session_id: id, parent_tool_use_id: null, message: { id: 'same-api-message', stop_reason: null, usage: { input_tokens: 10, output_tokens: 2 }, content: [{ type: 'text', text: 'partial' }] } },
-      { type: 'assistant', uuid: 'complete', session_id: id, parent_tool_use_id: null, message: { id: 'same-api-message', stop_reason: 'end_turn', usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 80, cache_creation_input_tokens: 7 }, content: [{ type: 'text', text: 'complete' }] } },
-      { type: 'assistant', uuid: 'missing', session_id: id, parent_tool_use_id: null, message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'old client' }] } },
-      { type: 'assistant', uuid: 'invalid', session_id: id, parent_tool_use_id: null, message: { stop_reason: 'end_turn', usage: { input_tokens: -1, output_tokens: 4 }, content: [{ type: 'text', text: 'bad' }] } },
+      { type: 'assistant', uuid: 'plain', session_id: id, parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'from disk' }] } },
+      // Even a record that happens to carry Claude-shaped counts must not resurrect them.
+      { type: 'assistant', uuid: 'stale', session_id: id, parent_tool_use_id: null, message: { stop_reason: 'end_turn', usage: { input_tokens: 10, output_tokens: 4 }, content: [{ type: 'text', text: 'legacy' }] } },
     ],
   });
   const page = await fixture.service.messages('usage-history', { limit: 20 });
   assert.equal(page.messages[0].usage, undefined);
-  assert.deepEqual(page.messages[1].usage, { inputTokens: 10, outputTokens: 4, cacheReadInputTokens: 80, cacheCreationInputTokens: 7, scope: 'apiMessage' });
-  assert.equal(page.messages[2].usage, undefined);
-  assert.equal(page.messages[3].usage, undefined);
+  assert.equal(page.messages[1].usage, undefined);
+  assert.equal(page.messages[1].content, 'legacy');
 });
 
-test('invalid SDK history shapes are rejected and impossible timestamps are sanitized', async () => {
+test('invalid history shapes are rejected and impossible timestamps are sanitized', async () => {
   const cwd = process.cwd();
   const fixture = serviceWith([], null, {
     listSessions: async () => [{ sessionId: 'bad-history', cwd, summary: 'Bad', createdAt: 1e300, lastModified: 1e300 }],
@@ -170,7 +186,7 @@ test('invalid SDK history shapes are rejected and impossible timestamps are sani
   await assert.rejects(fixture.service.messages('bad-history'), (error) => error.statusCode === 502);
 });
 
-test('rename uses the exact discovered cwd, rejects active owners, and surfaces SDK failure', async () => {
+test('rename addresses the thread by id alone, rejects active owners, and surfaces failure', async () => {
   const cwd = process.cwd();
   let renameArgs;
   let infoArgs;
@@ -180,8 +196,9 @@ test('rename uses the exact discovered cwd, rejects active owners, and surfaces 
     getSessionInfo: async (...args) => { infoArgs = args; return { sessionId: 'saved', cwd, customTitle: 'Refreshed title', lastModified: 2 }; },
   });
   assert.equal((await saved.service.rename('saved', 'New')).name, 'Refreshed title');
-  assert.deepEqual(renameArgs, ['saved', 'New', { dir: cwd }]);
-  assert.deepEqual(infoArgs, ['saved', { dir: cwd }]);
+  // thread/name/set takes a thread id; there is no directory to scope it to.
+  assert.deepEqual(renameArgs, ['saved', 'New']);
+  assert.deepEqual(infoArgs, ['saved']);
   const active = serviceWith([{ id: 'job', cwd, kind: 'background', sessionId: 'active', state: 'working' }]);
   await assert.rejects(active.service.rename('active', 'No'), (error) => error.statusCode === 409);
   const failed = serviceWith([], null, {
@@ -195,7 +212,7 @@ test('an attached interactive record never erases its background agent or active
   const cwd = process.cwd();
   for (const state of ['blocked', 'done']) {
     const background = { id: 'job-id', cwd, kind: 'background', sessionId: 'shared-session', name: 'Maw', state, startedAt: 10 };
-    const terminal = { cwd, kind: 'interactive', sessionId: 'shared-session', name: 'Maw', pid: 42, status: 'idle', startedAt: 20 };
+    const terminal = { cwd, kind: 'interactive', sessionId: 'shared-session', name: 'Maw', pid: 42, status: 'busy', startedAt: 20 };
     for (const records of [[background, terminal], [terminal, background]]) {
       const { service } = serviceWith(records);
       const sessions = await service.list();
@@ -211,8 +228,7 @@ test('an attached interactive record never erases its background agent or active
   }
 });
 
-
-test('native grouping resolves symlink cwd while SDK history remains unscoped', async (t) => {
+test('native grouping resolves symlink cwd while thread history remains unscoped', async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'cc-native-alias-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const alias = path.join(directory, 'alias');
@@ -249,6 +265,7 @@ test('history snapshots skip the full read when the metadata token is unchanged'
   });
   const first = await fixture.service.historySnapshot('snapshot');
   assert.equal(messageReads, 1);
+  // The rollout's mtime and size are what actually move when an item is appended.
   assert.deepEqual(first, { changeToken: '[12,34,"/opt/black-oracle"]', messages: [] });
   assert.equal(await fixture.service.historySnapshot('snapshot', first.changeToken), null);
   assert.equal(messageReads, 1);
@@ -261,7 +278,7 @@ test('changed history snapshots return the latest fully normalized transcript', 
     getSessionMessages: async (...args) => {
       assert.deepEqual(args, ['snapshot', { limit: 10_001 }]);
       return [
-        { type: 'assistant', uuid: 'a', session_id: 'snapshot', parent_tool_use_id: null, timestamp: '2026-09-12T00:00:00Z', message: { stop_reason: 'end_turn', usage: { input_tokens: 2, output_tokens: 3 }, content: [{ type: 'tool_use', id: 'tool', name: 'Read', input: { file: 'x' } }] } },
+        { type: 'assistant', uuid: 'a', session_id: 'snapshot', parent_tool_use_id: null, timestamp: '2026-09-12T00:00:00Z', message: { content: [{ type: 'tool_use', id: 'tool', name: 'Read', input: { file: 'x' } }] } },
         { type: 'system', uuid: 'ignored', session_id: 'snapshot', parent_tool_use_id: null, message: {} },
       ];
     },
@@ -270,11 +287,11 @@ test('changed history snapshots return the latest fully normalized transcript', 
   assert.equal(result.changeToken, '[13,50,"/new/project"]');
   assert.equal(result.messages.length, 1);
   assert.equal(result.messages[0].tools[0].name, 'Read');
-  assert.deepEqual(result.messages[0].usage, { inputTokens: 2, outputTokens: 3, scope: 'apiMessage' });
+  assert.equal(result.messages[0].usage, undefined);
   assert.equal(result.messages[0].createdAt, '2026-09-12T00:00:00.000Z');
 });
 
-test('history snapshots distinguish missing sessions and SDK failures from empty history', async () => {
+test('history snapshots distinguish missing sessions and read failures from empty history', async () => {
   await assert.rejects(serviceWith([], null, { getSessionInfo: async () => undefined }).service.historySnapshot('missing'), error => error.statusCode === 404);
   await assert.rejects(serviceWith([], null, { getSessionInfo: async () => { throw new Error('metadata failed'); } }).service.historySnapshot('failed'), error => error.statusCode === 502);
   await assert.rejects(serviceWith([], null, {
@@ -303,22 +320,27 @@ test('history snapshots reject a transcript that changes during the read with a 
   assert.equal(infoReads, 2);
 });
 
-test('idle interactive ownership explains the still-open terminal and PID', async () => {
-  const { service } = serviceWith([{ kind: 'interactive', cwd: process.cwd(), sessionId: 'idle-session', pid: 22735, status: 'idle' }]);
+// Decision 7: liveness is the writer-lock claim itself. An idle open tab still holds it,
+// and the refusal has to say so or it reads as a bug to whoever left the tab open.
+test('an idle holder is still a holder, and the refusal names the PID and how to release it', async () => {
+  const { service } = serviceWith([{ kind: 'interactive', cwd: process.cwd(), sessionId: 'idle-session', pid: 22735, status: 'busy' }]);
   await assert.rejects(service.resumable('idle-session'), error => {
     assert.equal(error.statusCode, 409);
-    assert.match(error.message, /idle.*22735/);
+    assert.match(error.message, /writer lock/);
+    assert.match(error.message, /22735/);
+    assert.match(error.message, /open idle thread still counts as held/);
     assert.match(error.message, /exit/i);
+    assert.match(error.message, /History sync remains available/);
     return true;
   });
 });
 
 test('matched maw terminal enriches active ownership without authorizing a second writer', async () => {
-  const terminal = { sessionName: 'neo-oracle-ampere-token', target: 'neo-oracle-ampere-token:claude.0', paneId: '%94', attachCommand: "maw a 'neo-oracle-ampere-token'" };
+  const terminal = { sessionName: 'neo-oracle-ampere-token', target: 'neo-oracle-ampere-token:codex.0', paneId: '%94', attachCommand: "maw a 'neo-oracle-ampere-token'" };
   const queried = [];
   const fixture = serviceWith([
-    { kind: 'interactive', cwd: process.cwd(), sessionId: 'live', pid: 8909, status: 'idle' },
-    { kind: 'interactive', cwd: process.cwd(), sessionId: 'outside', pid: 8910, status: 'idle' },
+    { kind: 'interactive', cwd: process.cwd(), sessionId: 'live', pid: 8909, status: 'busy' },
+    { kind: 'interactive', cwd: process.cwd(), sessionId: 'outside', pid: 8910, status: 'busy' },
   ], null, {}, { locate: async pids => { queried.push(pids); return new Map([[8909, terminal]]); } });
   const sessions = await fixture.service.list();
   assert.deepEqual(queried[0].sort(), [8909, 8910]);
@@ -333,7 +355,7 @@ test('matched maw terminal enriches active ownership without authorizing a secon
 });
 
 test('maw lookup failure leaves active ownership blocked and normal discovery usable', async () => {
-  const { service } = serviceWith([{ kind: 'interactive', cwd: process.cwd(), sessionId: 'live', pid: 8909, status: 'idle' }], null, {}, {
+  const { service } = serviceWith([{ kind: 'interactive', cwd: process.cwd(), sessionId: 'live', pid: 8909, status: 'busy' }], null, {}, {
     locate: async () => { throw new Error('maw unavailable'); },
   });
   assert.equal((await service.list())[0].existingTerminal, undefined);
@@ -350,11 +372,11 @@ test('saved sessions without an owner skip maw lookup', async () => {
 });
 
 test('a PID shared by different sessions is ambiguous and gets no terminal shortcut', async () => {
-  const terminal = { sessionName: 'existing', target: 'existing:claude.0', paneId: '%1', attachCommand: "maw a 'existing'" };
+  const terminal = { sessionName: 'existing', target: 'existing:codex.0', paneId: '%1', attachCommand: "maw a 'existing'" };
   const { service } = serviceWith([
-    { kind: 'interactive', cwd: process.cwd(), sessionId: 'first', pid: 42, status: 'idle' },
-    { kind: 'interactive', cwd: process.cwd(), sessionId: 'second', pid: 42, status: 'idle' },
-    { kind: 'interactive', cwd: process.cwd(), sessionId: 'unique', pid: 43, status: 'idle' },
+    { kind: 'interactive', cwd: process.cwd(), sessionId: 'first', pid: 42, status: 'busy' },
+    { kind: 'interactive', cwd: process.cwd(), sessionId: 'second', pid: 42, status: 'busy' },
+    { kind: 'interactive', cwd: process.cwd(), sessionId: 'unique', pid: 43, status: 'busy' },
   ], null, {}, { locate: async () => new Map([[42, terminal], [43, terminal]]) });
   const sessions = await service.list();
   assert.equal(sessions.find(s => s.sessionId === 'first').existingTerminal, undefined);

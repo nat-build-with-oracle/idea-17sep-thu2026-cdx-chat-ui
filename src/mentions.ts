@@ -158,7 +158,7 @@ export function buildMentionCandidates({
     const chat = chatBySession.get(sessionId)
     const native = nativeBySession.get(sessionId)
     const project = chat?.projectId ? projectById.get(chat.projectId) : undefined
-    const name = chat?.title.trim() || native?.name?.trim() || `Claude session ${sessionId.slice(0, 8)}`
+    const name = chat?.title.trim() || native?.name?.trim() || `Codex thread ${sessionId.slice(0, 8)}`
     // The native cwd is the exact execution path. A saved project's path may be
     // a canonicalized or symlink alias and is only the fallback when inventory
     // no longer contains the native session. A missing named project must not be

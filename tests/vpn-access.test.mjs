@@ -179,7 +179,13 @@ for (const authMode of ['NO_AUTH', 'WITH_AUTH']) {
     const distDir = path.join(dataDir, 'dist');
     await mkdir(distDir);
     await writeFile(path.join(distDir, 'index.html'), '<!doctype html><title>ARRA</title>');
-    const backend = await createServer({ dataDir, distDir, allowAnyOrigin: false });
+    const backend = await createServer({
+      dataDir, distDir, allowAnyOrigin: false,
+      // This suite is about the VPN boundary; it must never reach a real codex.
+      runner: { async health() { return { claudeAvailable: false, claudeVersion: null }; }, async stopAll() {} },
+      listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }] }),
+      environment: { PATH: process.env.PATH, CODEX_HOME: path.join(dataDir, 'codex-home') },
+    });
     backend.listen(0, '127.0.0.1');
     await once(backend, 'listening');
     const port = backend.address().port;

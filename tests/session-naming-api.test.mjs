@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createServer } from '../server/app.mjs';
-import { SessionNamingService } from '../server/session-naming.mjs';
+import { SessionNamingService } from '../server/codex-session-naming.mjs';
 
 class FakeRunner {
   async health() { return { claudeAvailable: true, claudeVersion: 'test' }; }
@@ -18,6 +18,9 @@ async function fixture(overrides = {}) {
     cwd: process.cwd(),
     runner: new FakeRunner(),
     devOrigin: 'http://127.0.0.1:5173',
+    // Never spawn the real codex binary, and never point any reader at the real ~/.codex.
+    listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }] }),
+    environment: { PATH: process.env.PATH, CODEX_HOME: path.join(dataDir, 'codex-home') },
     ...overrides,
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -43,13 +46,13 @@ async function request(origin, pathname, body, method = 'POST') {
 
 function chat(id, { title = 'Original title', sessionId = null, messages = [] } = {}) {
   return {
-    id, title, projectId: null, sessionId, model: 'sonnet', permissionMode: 'default',
+    id, title, projectId: null, sessionId, provider: 'codex', model: 'gpt-6-astra', permissionMode: 'default',
     createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
     messages, status: 'idle',
   };
 }
 
-test('health advertises Claude naming capability', async (t) => {
+test('health advertises Codex naming capability', async (t) => {
   const f = await fixture({ sessionNameGenerator: async () => ({ summary: 'x', suggestions: ['a', 'b', 'c'] }) });
   t.after(() => f.close());
   const result = await request(f.origin, '/api/health', undefined, 'GET');
@@ -97,7 +100,7 @@ test('chat suggestion reads bounded text only and never mutates stored transcrip
   assert.match(generatorInput.transcript, /^USER:\nhead/);
   assert.match(generatorInput.transcript, /ASSISTANT:\ntail marker$/);
   assert.doesNotMatch(generatorInput.transcript, /message-id|assistant-id|tool payload/);
-  assert.deepEqual(generatorInput.context, { kind: 'chat', model: 'sonnet' });
+  assert.deepEqual(generatorInput.context, { kind: 'chat', model: 'gpt-6-astra' });
   assert.deepEqual(f.server.app.store.snapshot(), before);
   assert.deepEqual(nativeCalls, { list: 0, messages: 0, rename: 0 });
 });
@@ -134,7 +137,7 @@ test('native suggestion reads at most 200 messages and reports source truncation
   assert.equal(result.value.messageCount, 200);
   assert.equal(result.value.truncated, true);
   assert.equal(generatorInput.sourceTruncated, undefined);
-  assert.deepEqual(generatorInput.context, { kind: 'native', model: 'sonnet' });
+  assert.deepEqual(generatorInput.context, { kind: 'native', model: null });
   assert.deepEqual(calls, { messages: 1, rename: 0 });
 });
 

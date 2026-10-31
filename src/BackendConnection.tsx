@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from 'react'
 import { backendTarget, DEFAULT_BACKEND, isLoopback } from './backend-target'
-import { ClaudeMark } from './Icon'
+import { BrandMark } from './Icon'
 
 export default function BackendConnection({ children }: { children: ReactNode }) {
   const href = window.location.href
@@ -30,8 +30,8 @@ export default function BackendConnection({ children }: { children: ReactNode })
   if (ready && target) return children
   return <main className="backend-connect">
     <div className="backend-connect-content">
-      <ClaudeMark /><h1>Your Claude. Your backend.</h1>
-      <p>The interface is hosted on Cloudflare. Conversations, files, and Claude execution stay on the backend you choose.</p>
+      <BrandMark /><h1>Your Codex. Your backend.</h1>
+      <p>The interface is hosted on Cloudflare. Conversations, files, and Codex execution stay on the backend you choose.</p>
       <form onSubmit={connect}>
         <label htmlFor="backend-address">Backend address</label>
         <input id="backend-address" value={address} onChange={event => setAddress(event.target.value)} placeholder={DEFAULT_BACKEND} spellCheck={false} autoCapitalize="off" required />

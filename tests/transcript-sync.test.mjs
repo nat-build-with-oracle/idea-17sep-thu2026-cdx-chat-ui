@@ -1,9 +1,78 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { reconcileMessages, transcriptHash } from '../server/transcript-sync.mjs';
+import { MCP_DENIED } from '../server/codex-items.mjs';
+import { CodexRunner } from '../server/codex-runner.mjs';
 
 const native = (id, role, text, blocks = [{ type: 'text', text }]) => ({ id, role, content: text, createdAt: '2026-09-12T00:00:00.000Z', status: 'complete', history: { sourceUuid: id, blocks } });
 const app = (id, role, content, extra = {}) => ({ id, role, content, createdAt: '2026-09-12T00:00:00.000Z', status: 'complete', ...extra });
+
+/** A live turn and a later sync of that turn are two renderings of one conversation, and
+ * only running both catches them drifting apart. The double answers the app-server's
+ * requests and pushes the items the turn would have emitted. */
+function liveTurn(items, { permissionMode = 'bypassPermissions', tokenUsage } = {}) {
+  const listeners = new Set();
+  const emit = (method, params) => { for (const listener of [...listeners]) listener(params, { method }); };
+  const connection = {
+    async start() {},
+    on(methods, listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    onExit() { return () => {}; },
+    async close() {},
+    async request(method) {
+      if (method === 'thread/start') return { thread: { id: 'session' } };
+      // No MCP server configured, so the permission notice stays out of the turn's text.
+      if (method === 'config/read') return { config: { mcp_servers: {} } };
+      if (method !== 'turn/start') return {};
+      queueMicrotask(() => {
+        for (const item of items) emit('item/completed', { item });
+        if (tokenUsage) emit('thread/tokenUsage/updated', { tokenUsage });
+        emit('turn/completed', { turn: { status: 'completed' } });
+      });
+      return { turn: { id: 'turn-1' } };
+    },
+  };
+  return new CodexRunner({ createConnection: () => connection })
+    .run({ chatId: 'c1', permissionMode, cwd: process.cwd(), prompt: 'go', onUpdate() {} });
+}
+
+test('a turn of several agent messages reads after sync exactly as it read live', async () => {
+  const first = "I'll call `oracle_concepts` with a limit of 2.";
+  const second = 'Attempted `oracle_concepts` with `limit: 2`, but the call was refused.';
+  const live = await liveTurn(
+    [{ type: 'agentMessage', id: 'a1', text: first }, { type: 'agentMessage', id: 'a2', text: second }],
+    { tokenUsage: { last: { inputTokens: 10, outputTokens: 2 } } },
+  );
+  assert.equal(live.text, `${first}\n\n${second}`);
+
+  const saved = [app('app-u', 'user', 'go'), app('app-a', 'assistant', live.text, { usage: live.usage, nativeSourceIds: live.sourceUuids })];
+  const source = [native('u', 'user', 'go'), native('a1', 'assistant', first), native('a2', 'assistant', second)];
+  const synced = reconcileMessages(saved, source);
+  assert.equal(synced.length, 2);
+  assert.equal(synced[1].content, live.text);
+  // Observed verbatim before the fix: "…with a limit of 2.Attempted…", glued with no space.
+  assert.doesNotMatch(synced[1].content, /2\.Attempted/);
+  assert.deepEqual(reconcileMessages(synced, source), synced);
+});
+
+test('a refused MCP call reads after sync exactly as it read live, not as a plain result', async () => {
+  const refusal = 'MCP tool call requires approval, but approval policy is never';
+  const live = await liveTurn(
+    [{ type: 'mcpToolCall', id: 'mcp-1', status: 'failed', server: 'arra-oracle', tool: 'oracle_concepts', arguments: { limit: 2 }, error: { message: refusal } }],
+    { permissionMode: 'default' },
+  );
+  const call = { type: 'tool', id: 'mcp-1', name: 'arra-oracle.oracle_concepts', input: { limit: 2 }, status: 'complete' };
+  const source = [native('u', 'user', 'go'), native('mcp-1', 'assistant', '', [call, { type: 'toolResult', toolUseId: 'mcp-1', content: refusal, isError: true }])];
+  const denied = reconcileMessages([], source)[1].history.blocks.at(-1);
+  assert.equal(denied.isError, true);
+  assert.equal(denied.content, live.tools[0].result.content);
+  assert.ok(denied.content.startsWith(MCP_DENIED));
+  // The reason codex gave is kept under the app's own words rather than hidden.
+  assert.match(denied.content, new RegExp(refusal));
+
+  // A genuine tool failure is not the sandbox refusing the call, and is not relabelled.
+  const failure = [native('u', 'user', 'go'), native('mcp-2', 'assistant', '', [{ ...call, id: 'mcp-2' }, { type: 'toolResult', toolUseId: 'mcp-2', content: 'upstream timeout', isError: true }])];
+  assert.equal(reconcileMessages([], failure)[1].history.blocks.at(-1).content, 'upstream timeout');
+});
 
 test('legacy app turns bind to native UUIDs; CLI additions appear once and usage survives', () => {
   const usage = { inputTokens: 12, outputTokens: 3, costUsd: 0.1, scope: 'allModels' };

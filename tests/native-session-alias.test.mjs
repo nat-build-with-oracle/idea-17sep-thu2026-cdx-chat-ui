@@ -37,7 +37,7 @@ function nativeService() {
 
 async function start(dataDir, nativeSessions) {
   const runner = { health: async () => ({ claudeAvailable: true, claudeVersion: 'test' }), stopAll: async () => {} }
-  const server = await createServer({ dataDir, cwd: process.cwd(), runner, nativeSessions, devOrigin: 'http://127.0.0.1:5173' })
+  const server = await createServer({ dataDir, cwd: process.cwd(), runner, nativeSessions, devOrigin: 'http://127.0.0.1:5173', listModels: async () => ({ data: [{ id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-sol' }] }), environment: { PATH: process.env.PATH, CODEX_HOME: path.join(dataDir, 'codex-home') }, })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   return {
     origin: `http://127.0.0.1:${server.address().port}`,

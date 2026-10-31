@@ -22,12 +22,22 @@ class FakeRunner {
   stopAll() { return Promise.resolve(); }
 }
 
+const CHAT_MODELS = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra'];
+// model/list would otherwise spawn the real codex binary, and a child spawned by a probe
+// outlives a fixture that does not await app.close().
+const listModels = async () => ({ data: [{ id: 'gpt-5.6-sol' }, { id: 'gpt-6-astra', isDefault: true }, { id: 'gpt-5.6-terra' }, { id: 'gpt-5.5-internal', hidden: true }] });
+
 async function fixture(overrides = {}) {
   const runner = new FakeRunner();
-  const server = await createServer({ dataDir: await mkdtemp(path.join(os.tmpdir(), 'cc-chat-api-')), cwd: process.cwd(), runner, devOrigin: 'http://127.0.0.1:5173', ...overrides });
+  const dataDir = overrides.dataDir ?? await mkdtemp(path.join(os.tmpdir(), 'cc-chat-api-'));
+  const server = await createServer({
+    dataDir, cwd: process.cwd(), runner, devOrigin: 'http://127.0.0.1:5173', listModels,
+    environment: { PATH: process.env.PATH, CODEX_HOME: path.join(dataDir, 'codex-home') },
+    ...overrides,
+  });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
-  return { runner, server, origin, close: () => new Promise((resolve) => server.close(resolve)) };
+  return { runner, server, origin, close: async () => { await server.app.close(); await new Promise((resolve) => server.close(resolve)); } };
 }
 
 async function jsonRequest(url, options = {}) {
@@ -172,10 +182,10 @@ test('first-turn project cwd is frozen and cannot be reassigned while running be
 test('native sessions can be listed and only inactive sessions can be imported and resumed', async (t) => {
   let active = false;
   const nativeSessions = {
-    list: async () => [{ id: 'short', cwd: process.cwd(), kind: 'background', name: 'Native name', pid: null, sessionId: 'native-full-id', startedAt: 1000, state: 'done', status: null, waitingFor: null, action: 'resume', terminalCommand: "cd '.' && claude --resume 'native-full-id'" }],
+    list: async () => [{ id: 'short', cwd: process.cwd(), kind: 'background', name: 'Native name', pid: null, sessionId: 'native-full-id', startedAt: 1000, state: 'done', status: null, waitingFor: null, action: 'resume', terminalCommand: "codex resume 'native-full-id'" }],
     async resumable(id) {
       assert.equal(id, 'native-full-id');
-      if (active) throw Object.assign(new Error('Native Claude session is active; use its terminal instead'), { statusCode: 409 });
+      if (active) throw Object.assign(new Error("Another Codex process still holds this thread's writer lock"), { statusCode: 409 });
       return (await this.list())[0];
     },
     async messages(id, options) {
@@ -194,6 +204,8 @@ test('native sessions can be listed and only inactive sessions can be imported a
   assert.equal(imported.value.nativeImported, true);
   assert.equal(imported.value.historyUnavailable, false);
   assert.equal(imported.value.title, 'Native name');
+  assert.equal(imported.value.provider, 'codex');
+  assert.equal(imported.value.model, 'gpt-6-astra');
   assert.equal(imported.value.messages[0].content, 'earlier');
   const existing = await jsonRequest(`${f.origin}/api/native-sessions/native-full-id/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
   assert.equal(existing.response.status, 200);
@@ -214,7 +226,7 @@ test('failed SDK rename leaves app chat title unchanged', async (t) => {
     async list() { return [{ id: 'saved', cwd: process.cwd(), kind: 'saved', name: 'Original', sessionId: 'rename-session', startedAt: 1, action: 'resume' }]; },
     async resumable() { return (await this.list())[0]; },
     async messages() { return { messages: [], nextOffset: null }; },
-    async rename() { throw Object.assign(new Error('Unable to rename native Claude session'), { statusCode: 502 }); },
+    async rename() { throw Object.assign(new Error('Unable to rename Codex thread'), { statusCode: 502 }); },
   };
   const f = await fixture({ nativeSessions }); t.after(f.close);
   const imported = await jsonRequest(`${f.origin}/api/native-sessions/rename-session/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
@@ -244,7 +256,7 @@ test('API validates projects, content type, host and origin', async (t) => {
 
 test('development Origin override must itself be loopback', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'cc-chat-api-'));
-  await assert.rejects(createServer({ dataDir, runner: new FakeRunner(), devOrigin: 'https://evil.example' }), /loopback/);
+  await assert.rejects(createServer({ dataDir, runner: new FakeRunner(), listModels, devOrigin: 'https://evil.example' }), /loopback/);
 });
 
 test('stop marks the active assistant interrupted and delete removes only the UI record', async (t) => {
@@ -258,14 +270,16 @@ test('stop marks the active assistant interrupted and delete removes only the UI
   assert.equal((await jsonRequest(`${f.origin}/api/state`)).value.chats.length, 0);
 });
 
-test('health exposes cwd and injected Claude availability', async (t) => {
+test('health exposes cwd, injected CLI availability, and the backend-supplied model list', async (t) => {
   const f = await fixture(); t.after(f.close);
   const result = await jsonRequest(`${f.origin}/api/health`);
   assert.equal(result.value.ok, true);
   assert.equal(result.value.claudeAvailable, true);
   assert.equal(result.value.claudeVersion, 'test');
   assert.equal(result.value.cwd, process.cwd());
-  assert.deepEqual(result.value.chatModels, ['sonnet', 'opus', 'haiku']);
+  // The default model is placed first so a client with no saved choice adopts it, and a
+  // hidden row is never offered.
+  assert.deepEqual(result.value.chatModels, CHAT_MODELS);
 });
 
 test('a persisted removed-provider chat is preserved across restart and cannot send', async (t) => {
@@ -296,7 +310,7 @@ test('a persisted removed-provider chat is preserved across restart and cannot s
   assert.equal(second.server.app.store.snapshot().chats[0].title, 'Saved');
 });
 
-test('SSE sends initial and changed state, and disconnecting does not cancel Claude', async (t) => {
+test('SSE sends initial and changed state, and disconnecting does not cancel the Codex turn', async (t) => {
   const f = await fixture(); t.after(f.close);
   const events = await openEvents(f.origin);
   const chat = (await jsonRequest(`${f.origin}/api/chats`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).value;
@@ -374,20 +388,22 @@ test('accepted turn keeps its model and permission configuration across delayed 
     },
   };
   const runner = new FakeRunner();
-  const f = await fixture({ nativeSessions, runner, environment: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'dummy-claude-key' } }); t.after(f.close);
+  const f = await fixture({ nativeSessions, runner, environment: { PATH: process.env.PATH, OPENAI_API_KEY: 'dummy-openai-key' } }); t.after(f.close);
   const imported = (await jsonRequest(`${f.origin}/api/native-sessions/config-session/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).value;
   await jsonRequest(`${f.origin}/api/chats/${imported.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'use accepted settings' }) });
-  const patched = await jsonRequest(`${f.origin}/api/chats/${imported.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'opus', permissionMode: 'default' }) });
+  const patched = await jsonRequest(`${f.origin}/api/chats/${imported.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-5.6-sol', permissionMode: 'default' }) });
   assert.equal(patched.response.status, 200);
   releaseRecheck(native);
   await new Promise((resolve) => {
     const check = () => runner.calls.length ? resolve() : setTimeout(check, 5);
     check();
   });
-  assert.equal(runner.calls[0].model, 'sonnet');
+  // The accepted turn keeps the configuration it was accepted with, not the later patch.
+  assert.equal(runner.calls[0].model, 'gpt-6-astra');
   assert.equal(runner.calls[0].permissionMode, 'bypassPermissions');
-  assert.equal(runner.calls[0].env.ANTHROPIC_BASE_URL, 'https://api.anthropic.com');
-  assert.equal(runner.calls[0].env.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(runner.calls[0].env.OPENAI_BASE_URL, 'https://api.openai.com/v1');
+  assert.equal(runner.calls[0].env.OPENAI_API_KEY, 'dummy-openai-key');
+  assert.equal(runner.calls[0].env.ANTHROPIC_BASE_URL, undefined);
   runner.complete(imported.id);
 });
 

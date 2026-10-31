@@ -216,7 +216,7 @@ export default function MentionComposer({ value, onChange, candidates, selected,
       }}
       onKeyDown={handleKeyDown}
       placeholder={placeholder}
-      aria-label="Message Claude"
+      aria-label="Message Codex"
       aria-autocomplete="list"
       aria-controls={popupOpen ? listboxId : undefined}
       aria-expanded={popupOpen}

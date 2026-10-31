@@ -24,11 +24,11 @@ test('selected references render as removable, factual chips without conversatio
     selected: [oracle, repository, session],
     onSelectedChange() {},
     disabled: false,
-    placeholder: 'Message Claude',
+    placeholder: 'Message Codex',
     inputRef: createRef(),
   }))
 
-  assert.match(html, /aria-label="Message Claude"/)
+  assert.match(html, /aria-label="Message Codex"/)
   assert.match(html, /aria-autocomplete="list"/)
   assert.match(html, /Remove Mother Oracle reference/)
   assert.match(html, /Mother Oracle<\/span><small>Oracle<\/small>/)

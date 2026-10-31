@@ -11,7 +11,7 @@ export interface SlashCommandQuery {
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { token: '/rename', description: 'Rename this conversation' },
-  { token: '/list-agents', description: 'Find running Claude agents' },
+  { token: '/list-agents', description: 'Find running Codex agents' },
 ]
 
 export function slashCommandQueryAtCaret(text: string, caret: number): SlashCommandQuery | null {
